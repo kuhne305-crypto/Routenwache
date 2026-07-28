@@ -226,10 +226,10 @@ async def update_stempel_liste(guild):
 
 
 # ─── Slash-Commands ────────────────────────────────────────────────────────────
-# Hinweis: /stempel_posten und /set_stempel_liste bleiben Admin/Leitungs-
-# Befehle (reines Setup, keine Rollen-Prüfung fürs Stempeln selbst).
-# /zeit_hinzufuegen, /zeit_entfernen und /meine_zeit haben KEINE
-# Berechtigungs-Einschränkung – jedes Mitglied kann sie nutzen.
+# Hinweis: /stempel_posten, /set_stempel_liste und /zeitraum_entfernen bleiben
+# Admin/Leitungs-Befehle (Setup bzw. destruktive Aktion). /zeit_hinzufuegen,
+# /zeit_entfernen und /meine_zeit haben KEINE Berechtigungs-Einschränkung –
+# jedes Mitglied kann sie nutzen.
 
 @tree.command(name="set_stempel", description="Setzt den Channel für die Routenwache-Nachricht (Rein/Raus-Buttons)")
 @app_commands.describe(channel="Der Channel wo die Rein/Raus-Buttons gepostet werden")
@@ -319,6 +319,27 @@ async def zeit_entfernen(interaction: discord.Interaction, mitglied: discord.Mem
         ephemeral=True
     )
 
+@tree.command(name="zeitraum_entfernen", description="Löscht die komplette Routenwache-Statistik eines Mitglieds unwiederbringlich")
+@app_commands.describe(mitglied="Das Mitglied, dessen komplette Routenwache-Statistik gelöscht werden soll")
+@app_commands.check(ist_admin_oder_leitung)
+async def zeitraum_entfernen(interaction: discord.Interaction, mitglied: discord.Member):
+    uid = str(mitglied.id)
+    nutzer = data.get("stempel_nutzer", {})
+
+    if uid not in nutzer or (nutzer[uid]["gesamt_sekunden"] == 0 and nutzer[uid]["anzahl"] == 0):
+        await interaction.response.send_message(f"❌ Für {mitglied.mention} sind keine Zeiten erfasst.", ephemeral=True)
+        return
+
+    nutzer[uid] = {"eingestempelt_seit": None, "gesamt_sekunden": 0, "anzahl": 0}
+    save_data(data)
+
+    await update_stempel_liste(interaction.guild)
+
+    await interaction.response.send_message(
+        f"🗑️ Die komplette Routenwache-Statistik von {mitglied.mention} wurde gelöscht.",
+        ephemeral=True
+    )
+
 @tree.command(name="meine_zeit", description="Zeigt deinen eigenen Routenwache-Status")
 async def meine_zeit(interaction: discord.Interaction):
     eintrag = get_stempel_eintrag(str(interaction.user.id))
@@ -382,6 +403,25 @@ async def on_ready():
             print(f"❌ Fehler beim Auto-Posten fehlender Nachrichten: {e}")
 
     print("Bot ist bereit!")
+
+@bot.event
+async def on_member_remove(member: discord.Member):
+    """Entfernt automatisch den Routenwache-Eintrag eines Mitglieds,
+    sobald es den Server verlässt (Leave oder Kick)."""
+    uid = str(member.id)
+    nutzer = data.get("stempel_nutzer", {})
+
+    if uid not in nutzer:
+        return
+
+    del nutzer[uid]
+    save_data(data)
+    print(f"🧹 Routenwache-Eintrag von {member} ({uid}) entfernt (Server verlassen).")
+
+    try:
+        await update_stempel_liste(member.guild)
+    except Exception as e:
+        print(f"❌ Fehler beim Aktualisieren der Übersicht nach Austritt: {e}")
 
 @bot.event
 async def on_app_command_error(interaction: discord.Interaction, error):
