@@ -1,5 +1,5 @@
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 from discord import app_commands
 from datetime import datetime
 import pytz
@@ -9,7 +9,6 @@ import os
 # ════════════════════════════════════════════════════════════════════════════
 # ⚙️  KONFIGURATION
 # ════════════════════════════════════════════════════════════════════════════
-# Eigener Bot = eigenes Token und eigene GUILD_ID als Railway/Umgebungsvariable.
 TOKEN    = os.environ.get("DISCORD_TOKEN")
 GUILD_ID = os.environ.get("GUILD_ID")
 TIMEZONE = pytz.timezone("Europe/Berlin")
@@ -17,9 +16,12 @@ EMBED_COLOR = 0xFFD700  # Gelb
 DATA_DIR  = "/data" if os.path.isdir("/data") else "."
 DATA_FILE = os.path.join(DATA_DIR, "data.json")
 
+# Feste Zeiträume der Routenwache, jeweils max. 3 Plätze.
+SLOTS = ["20-21", "21-22", "22-23", "23-24"]
+MAX_PLAETZE_PRO_SLOT = 3
+
 # Leitung: darf das Setup (Channel setzen, Nachricht posten) erledigen.
-# Das eigentliche Ein-/Ausstempeln sowie das manuelle Nachtragen/Entfernen von
-# Zeit ist bewusst für ALLE offen (keine Rollen-Einschränkung).
+# Ein-/Austragen in einen Zeitraum ist bewusst für ALLE offen.
 LEITUNG_ROLLE_ID = 1526202327483285629
 
 def ist_admin_oder_leitung(interaction: discord.Interaction) -> bool:
@@ -45,7 +47,7 @@ def load_data():
         "stempel_nachricht_id": None,
         "channel_stempel_liste": 1531376274130341909,
         "stempel_liste_nachricht_id": None,
-        "stempel_nutzer": {},  # { "user_id": {"eingestempelt_seit": float|None, "gesamt_sekunden": float, "anzahl": int} }
+        "tage": {},  # { "28.07.2026": { "20-21": ["userid", ...], "21-22": [...], ... } }
     }
     if not geladen:
         return standard
@@ -72,145 +74,159 @@ tree = bot.tree
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# 🛣️  ROUTENWACHE (Rein-/Raus-Tracking + Zeit-Übersicht)
+# 🛣️  ROUTENWACHE (Zeitraum-Anmeldung für den heutigen Tag)
 # ════════════════════════════════════════════════════════════════════════════
 # Komplett offen: es gibt hier absichtlich KEINE Rollen-/Berechtigungs-
-# einschränkung. Jedes Mitglied kann sich ein-/ausstempeln UND Zeiten für
-# sich selbst oder andere manuell nachtragen bzw. entfernen.
+# einschränkung. Jedes Mitglied kann sich für einen Zeitraum ein-/austragen
+# und auch andere Mitglieder ein-/austragen.
 
-def get_stempel_eintrag(user_id: str):
-    """Holt (oder erstellt) den Routenwache-Eintrag eines Nutzers."""
-    nutzer = data.setdefault("stempel_nutzer", {})
-    if user_id not in nutzer:
-        nutzer[user_id] = {"eingestempelt_seit": None, "gesamt_sekunden": 0, "anzahl": 0}
-    return nutzer[user_id]
+def heute_key() -> str:
+    """Aktuelles Datum als String, z.B. '28.07.2026'."""
+    return datetime.now(TIMEZONE).strftime("%d.%m.%Y")
 
-def format_dauer(sekunden) -> str:
-    """Formatiert Sekunden als 'Xd Yh Zm' bzw. 'Yh Zm' / 'Zm'."""
-    sekunden = max(0, int(sekunden))
-    tage, rest = divmod(sekunden, 86400)
-    stunden, rest = divmod(rest, 3600)
-    minuten = rest // 60
+def slot_label(slot: str) -> str:
+    start, ende = slot.split("-")
+    return f"{start} - {ende} Uhr"
 
-    teile = []
-    if tage:
-        teile.append(f"{tage}d")
-    if stunden or tage:
-        teile.append(f"{stunden}h")
-    teile.append(f"{minuten}m")
-    return " ".join(teile)
+def get_tag_eintrag(datum: str) -> dict:
+    """Holt (oder erstellt) die Slot-Liste für ein bestimmtes Datum."""
+    tage = data.setdefault("tage", {})
+    eintrag = tage.setdefault(datum, {})
+    for slot in SLOTS:
+        eintrag.setdefault(slot, [])
+    return eintrag
 
-def build_stempel_embed():
-    embed = discord.Embed(
-        title="🛣️ Routenwache",
-        description=(
-            "Kurz und schmerzlos:\n"
-            "🟢 **Rein** – du bist ab jetzt auf Route, die Zeit läuft.\n"
-            "🔴 **Raus** – Feierabend, deine Zeit wird automatisch draufgerechnet.\n\n"
-            f"Die Gesamtübersicht mit allen Zeiten gibt's in <#{data.get('channel_stempel_liste')}>.\n"
-            "Und nicht vergessen wieder auszuchecken, sonst tickt die Uhr für immer weiter 😅"
-        ),
-        color=EMBED_COLOR
-    )
-    embed.set_footer(text="ECLIPSE – Routenwache")
+def finde_slot_von_user(eintrag: dict, uid: str):
+    """Gibt den Slot zurück, in dem uid heute bereits eingetragen ist (oder None)."""
+    for slot, liste in eintrag.items():
+        if uid in liste:
+            return slot
+    return None
+
+def build_wache_embed(datum: str, guild: discord.Guild) -> discord.Embed:
+    embed = discord.Embed(title=f"🛣️ Routenwache Heute ({datum})", color=EMBED_COLOR)
+    eintrag = get_tag_eintrag(datum)
+
+    bloecke = []
+    for slot in SLOTS:
+        leute = eintrag.get(slot, [])
+        namen = []
+        for uid in leute:
+            member = guild.get_member(int(uid)) if guild else None
+            namen.append(member.mention if member else f"Unbekanntes Mitglied ({uid})")
+        text = "\n".join(namen) if namen else "*– frei –*"
+        voll_hinweis = " 🔒 (voll)" if len(leute) >= MAX_PLAETZE_PRO_SLOT else ""
+        bloecke.append(f"**{slot_label(slot)}**{voll_hinweis}\n{text}")
+
+    embed.description = "\n\n".join(bloecke)
+    embed.set_footer(text="ECLIPSE – Routenwache • Wähle unten deinen Zeitraum (max. 3 Plätze pro Stunde)")
+    embed.timestamp = datetime.now(TIMEZONE)
     return embed
 
-class StempelView(discord.ui.View):
+
+class WacheView(discord.ui.View):
+    """Persistente View mit einem Button pro Zeitraum. Wird dynamisch
+    neu aufgebaut, damit volle Zeiträume ausgegraut/deaktiviert sind."""
+
     def __init__(self):
         super().__init__(timeout=None)
+        self.build_buttons()
 
-    @discord.ui.button(label="REIN", style=discord.ButtonStyle.success, custom_id="btn_stempel_ein")
-    async def btn_ein(self, interaction: discord.Interaction, button: discord.ui.Button):
-        eintrag = get_stempel_eintrag(str(interaction.user.id))
-        if eintrag["eingestempelt_seit"] is not None:
-            await interaction.response.send_message("❌ Du bist schon auf Route.", ephemeral=True)
+    def build_buttons(self):
+        self.clear_items()
+        today = heute_key()
+        eintrag = get_tag_eintrag(today)
+        for slot in SLOTS:
+            leute = eintrag.get(slot, [])
+            voll = len(leute) >= MAX_PLAETZE_PRO_SLOT
+            button = discord.ui.Button(
+                label=f"{slot_label(slot)} ({len(leute)}/{MAX_PLAETZE_PRO_SLOT})",
+                style=discord.ButtonStyle.success if not voll else discord.ButtonStyle.secondary,
+                disabled=voll,
+                custom_id=f"wache_slot_{slot}",
+            )
+            button.callback = self._make_callback(slot)
+            self.add_item(button)
+
+    def _make_callback(self, slot: str):
+        async def callback(interaction: discord.Interaction):
+            await self.handle_click(interaction, slot)
+        return callback
+
+    async def handle_click(self, interaction: discord.Interaction, slot: str):
+        today = heute_key()
+        eintrag = get_tag_eintrag(today)
+        uid = str(interaction.user.id)
+
+        bestehender_slot = finde_slot_von_user(eintrag, uid)
+        if bestehender_slot:
+            await interaction.response.send_message(
+                f"❌ Du bist heute schon für **{slot_label(bestehender_slot)}** eingetragen. "
+                f"Mit `/wache_austragen` kannst du dich zuerst wieder austragen.",
+                ephemeral=True
+            )
             return
-        eintrag["eingestempelt_seit"] = datetime.now(TIMEZONE).timestamp()
-        save_data(data)
-        await interaction.response.send_message("🟢 Bist drin. Viel Erfolg da draußen!", ephemeral=True)
 
-    @discord.ui.button(label="RAUS", style=discord.ButtonStyle.danger, custom_id="btn_stempel_aus")
-    async def btn_aus(self, interaction: discord.Interaction, button: discord.ui.Button):
-        eintrag = get_stempel_eintrag(str(interaction.user.id))
-        if eintrag["eingestempelt_seit"] is None:
-            await interaction.response.send_message("❌ Du bist gerade gar nicht auf Route.", ephemeral=True)
+        liste = eintrag.setdefault(slot, [])
+        if len(liste) >= MAX_PLAETZE_PRO_SLOT:
+            await interaction.response.send_message(
+                "❌ Dieser Zeitraum ist leider gerade eben voll geworden. Bitte wähle einen anderen.",
+                ephemeral=True
+            )
+            self.build_buttons()
+            try:
+                await interaction.message.edit(embed=build_wache_embed(today, interaction.guild), view=self)
+            except Exception:
+                pass
             return
 
-        dauer_sekunden = datetime.now(TIMEZONE).timestamp() - eintrag["eingestempelt_seit"]
-        eintrag["gesamt_sekunden"] += dauer_sekunden
-        eintrag["anzahl"] += 1
-        eintrag["eingestempelt_seit"] = None
+        liste.append(uid)
         save_data(data)
+        self.build_buttons()
 
-        await interaction.response.send_message(
-            f"🔴 Feierabend! Diese Runde: **{format_dauer(dauer_sekunden)}**\n"
-            f"Deine Gesamtzeit: **{format_dauer(eintrag['gesamt_sekunden'])}**",
-            ephemeral=True
-        )
-        await update_stempel_liste(interaction.guild)
+        embed = build_wache_embed(today, interaction.guild)
+        await interaction.response.edit_message(embed=embed, view=self)
+        await interaction.followup.send(f"🟢 Du bist eingetragen für **{slot_label(slot)}**!", ephemeral=True)
 
-async def stempel_posten_intern(guild):
+        await update_wache_liste(interaction.guild)
+
+
+wache_view = WacheView()
+
+async def refresh_wache_nachricht(guild: discord.Guild):
     if not data.get("channel_stempel"):
         return
     kanal = guild.get_channel(int(data["channel_stempel"]))
     if not kanal:
         return
 
-    embed = build_stempel_embed()
-    view  = StempelView()
+    today = heute_key()
+    wache_view.build_buttons()
+    embed = build_wache_embed(today, guild)
 
     msg_id = data.get("stempel_nachricht_id")
     if msg_id:
         try:
             msg = await kanal.fetch_message(int(msg_id))
-            await msg.edit(embed=embed, view=view)
+            await msg.edit(embed=embed, view=wache_view)
             return
         except Exception as e:
             print(f"Alte Routenwache-Nachricht nicht gefunden, poste neu: {e}")
 
-    msg = await kanal.send(embed=embed, view=view)
+    msg = await kanal.send(embed=embed, view=wache_view)
     data["stempel_nachricht_id"] = str(msg.id)
     save_data(data)
 
-def build_stempel_liste_embed(guild):
-    embed = discord.Embed(title="📊 Routenwache – Übersicht", color=EMBED_COLOR)
-
-    eintraege = [
-        (uid, info) for uid, info in data.get("stempel_nutzer", {}).items()
-        if info.get("gesamt_sekunden", 0) > 0 or info.get("anzahl", 0) > 0
-    ]
-    eintraege.sort(key=lambda x: x[1]["gesamt_sekunden"], reverse=True)
-
-    if not eintraege:
-        embed.description = "*Noch keine Zeiten erfasst.*"
-        embed.set_footer(text="ECLIPSE – Routenwache")
-        embed.timestamp = datetime.now(TIMEZONE)
-        return embed
-
-    zeilen = []
-    for platz, (uid, info) in enumerate(eintraege, start=1):
-        member = guild.get_member(int(uid))
-        name = member.mention if member else f"Unbekanntes Mitglied ({uid})"
-        zeilen.append(
-            f"{platz}. {name} ({format_dauer(info['gesamt_sekunden'])} – {info['anzahl']} Zeiträume)"
-        )
-
-    beschreibung = "\n".join(zeilen)
-    if len(beschreibung) > 4000:
-        beschreibung = beschreibung[:4000] + "\n…"
-    embed.description = beschreibung
-    embed.set_footer(text="ECLIPSE – Routenwache")
-    embed.timestamp = datetime.now(TIMEZONE)
-    return embed
-
-async def update_stempel_liste(guild):
+async def update_wache_liste(guild: discord.Guild):
     if not data.get("channel_stempel_liste"):
         return
     kanal = guild.get_channel(int(data["channel_stempel_liste"]))
     if not kanal:
         return
 
-    embed = build_stempel_liste_embed(guild)
+    today = heute_key()
+    embed = build_wache_embed(today, guild)
+
     msg_id = data.get("stempel_liste_nachricht_id")
     if msg_id:
         try:
@@ -226,132 +242,103 @@ async def update_stempel_liste(guild):
 
 
 # ─── Slash-Commands ────────────────────────────────────────────────────────────
-# Hinweis: /stempel_posten, /set_stempel_liste und /zeitraum_entfernen bleiben
-# Admin/Leitungs-Befehle (Setup bzw. destruktive Aktion). /zeit_hinzufuegen,
-# /zeit_entfernen und /meine_zeit haben KEINE Berechtigungs-Einschränkung –
-# jedes Mitglied kann sie nutzen.
+# Hinweis: /wache_channel_setzen, /wache_liste_channel_setzen und /wache_posten
+# bleiben Admin/Leitungs-Befehle (Setup). /wache_eintragen, /wache_austragen und
+# /meine_wache haben KEINE Berechtigungs-Einschränkung – jedes Mitglied kann sie
+# nutzen (auch für andere Mitglieder).
 
-@tree.command(name="set_stempel", description="Setzt den Channel für die Routenwache-Nachricht (Rein/Raus-Buttons)")
-@app_commands.describe(channel="Der Channel wo die Rein/Raus-Buttons gepostet werden")
+@tree.command(name="wache_channel_setzen", description="Setzt den Channel für die Routenwache-Buttons")
+@app_commands.describe(channel="Der Channel wo die Zeitraum-Buttons gepostet werden")
 @app_commands.check(ist_admin_oder_leitung)
-async def set_stempel(interaction: discord.Interaction, channel: discord.TextChannel):
+async def wache_channel_setzen(interaction: discord.Interaction, channel: discord.TextChannel):
     data["channel_stempel"] = channel.id
     data["stempel_nachricht_id"] = None
     save_data(data)
     await interaction.response.send_message(f"✅ Routenwache-Channel gesetzt: {channel.mention}", ephemeral=True)
-    await stempel_posten_intern(interaction.guild)
+    await refresh_wache_nachricht(interaction.guild)
 
-@tree.command(name="set_stempel_liste", description="Setzt den Channel für die Routenwache-Übersicht")
-@app_commands.describe(channel="Der Channel wo die Zeit-Übersicht aller Mitglieder gepostet wird")
+@tree.command(name="wache_liste_channel_setzen", description="Setzt den Channel für die Routenwache-Übersicht")
+@app_commands.describe(channel="Der Channel wo die Tages-Übersicht gepostet wird")
 @app_commands.check(ist_admin_oder_leitung)
-async def set_stempel_liste(interaction: discord.Interaction, channel: discord.TextChannel):
+async def wache_liste_channel_setzen(interaction: discord.Interaction, channel: discord.TextChannel):
     data["channel_stempel_liste"] = channel.id
     data["stempel_liste_nachricht_id"] = None
     save_data(data)
     await interaction.response.send_message(f"✅ Routenwache-Übersicht-Channel gesetzt: {channel.mention}", ephemeral=True)
-    await update_stempel_liste(interaction.guild)
+    await update_wache_liste(interaction.guild)
 
-@tree.command(name="stempel_posten", description="Postet oder aktualisiert die Routenwache-Nachricht (Rein/Raus-Buttons)")
+@tree.command(name="wache_posten", description="Postet oder aktualisiert die Routenwache-Nachricht (Zeitraum-Buttons)")
 @app_commands.check(ist_admin_oder_leitung)
-async def stempel_posten(interaction: discord.Interaction):
+async def wache_posten(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
-    await stempel_posten_intern(interaction.guild)
-    await update_stempel_liste(interaction.guild)
+    await refresh_wache_nachricht(interaction.guild)
+    await update_wache_liste(interaction.guild)
     await interaction.followup.send("✅ Routenwache-Nachricht gepostet/aktualisiert.", ephemeral=True)
 
-@tree.command(name="zeit_hinzufuegen", description="Trägt manuell Zeit für ein Mitglied nach")
-@app_commands.describe(
-    mitglied="Das Mitglied, dem Zeit gutgeschrieben werden soll",
-    stunden="Anzahl Stunden (optional)",
-    minuten="Anzahl Minuten (optional)",
-    datum="Datum, für das die Zeit gilt, z.B. 27.07.2026 (nur zur Dokumentation)"
-)
-async def zeit_hinzufuegen(interaction: discord.Interaction, mitglied: discord.Member, stunden: int = 0, minuten: int = 0, datum: str = None):
-    if stunden <= 0 and minuten <= 0:
-        await interaction.response.send_message("❌ Bitte Stunden und/oder Minuten angeben.", ephemeral=True)
-        return
-    if stunden < 0 or minuten < 0:
-        await interaction.response.send_message("❌ Stunden/Minuten dürfen nicht negativ sein.", ephemeral=True)
-        return
+WACHE_CHOICES = [app_commands.Choice(name=slot_label(s), value=s) for s in SLOTS]
 
-    sekunden = stunden * 3600 + minuten * 60
-    eintrag = get_stempel_eintrag(str(mitglied.id))
-    eintrag["gesamt_sekunden"] += sekunden
-    eintrag["anzahl"] += 1
-    save_data(data)
-
-    await update_stempel_liste(interaction.guild)
-
-    datum_text = f" (Datum: {datum})" if datum else ""
-    await interaction.response.send_message(
-        f"✅ {mitglied.mention} wurden **{format_dauer(sekunden)}** gutgeschrieben{datum_text}.\n"
-        f"Neue Gesamtzeit: **{format_dauer(eintrag['gesamt_sekunden'])}**",
-        ephemeral=True
-    )
-
-@tree.command(name="zeit_entfernen", description="Zieht manuell Zeit von einem Mitglied ab")
-@app_commands.describe(
-    mitglied="Das Mitglied, dem Zeit abgezogen werden soll",
-    stunden="Anzahl Stunden (optional)",
-    minuten="Anzahl Minuten (optional)",
-    datum="Datum, für das die Zeit gilt, z.B. 27.07.2026 (nur zur Dokumentation)"
-)
-async def zeit_entfernen(interaction: discord.Interaction, mitglied: discord.Member, stunden: int = 0, minuten: int = 0, datum: str = None):
-    if stunden <= 0 and minuten <= 0:
-        await interaction.response.send_message("❌ Bitte Stunden und/oder Minuten angeben.", ephemeral=True)
-        return
-    if stunden < 0 or minuten < 0:
-        await interaction.response.send_message("❌ Stunden/Minuten dürfen nicht negativ sein.", ephemeral=True)
-        return
-
-    sekunden = stunden * 3600 + minuten * 60
-    eintrag = get_stempel_eintrag(str(mitglied.id))
-    eintrag["gesamt_sekunden"] = max(0, eintrag["gesamt_sekunden"] - sekunden)
-    eintrag["anzahl"] = max(0, eintrag["anzahl"] - 1)
-    save_data(data)
-
-    await update_stempel_liste(interaction.guild)
-
-    datum_text = f" (Datum: {datum})" if datum else ""
-    await interaction.response.send_message(
-        f"✅ {mitglied.mention} wurden **{format_dauer(sekunden)}** abgezogen{datum_text}.\n"
-        f"Neue Gesamtzeit: **{format_dauer(eintrag['gesamt_sekunden'])}**",
-        ephemeral=True
-    )
-
-@tree.command(name="zeitraum_entfernen", description="Löscht die komplette Routenwache-Statistik eines Mitglieds unwiederbringlich")
-@app_commands.describe(mitglied="Das Mitglied, dessen komplette Routenwache-Statistik gelöscht werden soll")
-@app_commands.check(ist_admin_oder_leitung)
-async def zeitraum_entfernen(interaction: discord.Interaction, mitglied: discord.Member):
+@tree.command(name="wache_eintragen", description="Trägt ein Mitglied manuell in einen heutigen Zeitraum ein")
+@app_commands.describe(mitglied="Das Mitglied", zeitraum="Der Zeitraum")
+@app_commands.choices(zeitraum=WACHE_CHOICES)
+async def wache_eintragen(interaction: discord.Interaction, mitglied: discord.Member, zeitraum: app_commands.Choice[str]):
+    today = heute_key()
+    eintrag = get_tag_eintrag(today)
     uid = str(mitglied.id)
-    nutzer = data.get("stempel_nutzer", {})
+    slot = zeitraum.value
 
-    if uid not in nutzer or (nutzer[uid]["gesamt_sekunden"] == 0 and nutzer[uid]["anzahl"] == 0):
-        await interaction.response.send_message(f"❌ Für {mitglied.mention} sind keine Zeiten erfasst.", ephemeral=True)
+    bestehender_slot = finde_slot_von_user(eintrag, uid)
+    if bestehender_slot:
+        await interaction.response.send_message(
+            f"❌ {mitglied.mention} ist heute schon für **{slot_label(bestehender_slot)}** eingetragen.",
+            ephemeral=True
+        )
         return
 
-    nutzer[uid] = {"eingestempelt_seit": None, "gesamt_sekunden": 0, "anzahl": 0}
+    liste = eintrag.setdefault(slot, [])
+    if len(liste) >= MAX_PLAETZE_PRO_SLOT:
+        await interaction.response.send_message(f"❌ **{slot_label(slot)}** ist bereits voll.", ephemeral=True)
+        return
+
+    liste.append(uid)
     save_data(data)
 
-    await update_stempel_liste(interaction.guild)
+    await interaction.response.send_message(f"✅ {mitglied.mention} wurde für **{slot_label(slot)}** eingetragen.", ephemeral=True)
+    await refresh_wache_nachricht(interaction.guild)
+    await update_wache_liste(interaction.guild)
 
-    await interaction.response.send_message(
-        f"🗑️ Die komplette Routenwache-Statistik von {mitglied.mention} wurde gelöscht.",
-        ephemeral=True
-    )
+@tree.command(name="wache_austragen", description="Trägt dich (oder ein anderes Mitglied) aus der heutigen Routenwache aus")
+@app_commands.describe(mitglied="Optional: anderes Mitglied austragen (Standard: du selbst)")
+async def wache_austragen(interaction: discord.Interaction, mitglied: discord.Member = None):
+    ziel = mitglied or interaction.user
+    today = heute_key()
+    eintrag = get_tag_eintrag(today)
+    uid = str(ziel.id)
 
-@tree.command(name="meine_zeit", description="Zeigt deinen eigenen Routenwache-Status")
-async def meine_zeit(interaction: discord.Interaction):
-    eintrag = get_stempel_eintrag(str(interaction.user.id))
+    gefundener_slot = finde_slot_von_user(eintrag, uid)
+    if not gefundener_slot:
+        await interaction.response.send_message(f"❌ {ziel.mention} ist heute für keinen Zeitraum eingetragen.", ephemeral=True)
+        return
+
+    eintrag[gefundener_slot].remove(uid)
     save_data(data)
-    status_text = "🟢 gerade auf Route" if eintrag["eingestempelt_seit"] else "🔴 gerade nicht auf Route"
-    await interaction.response.send_message(
-        f"**Deine Routenwache**\n"
-        f"Status: {status_text}\n"
-        f"Gesamtzeit: **{format_dauer(eintrag['gesamt_sekunden'])}**\n"
-        f"Zeiträume: **{eintrag['anzahl']}**",
-        ephemeral=True
-    )
+
+    await interaction.response.send_message(f"✅ {ziel.mention} wurde aus **{slot_label(gefundener_slot)}** ausgetragen.", ephemeral=True)
+    await refresh_wache_nachricht(interaction.guild)
+    await update_wache_liste(interaction.guild)
+
+@tree.command(name="meine_wache", description="Zeigt deinen heutigen Routenwache-Status")
+async def meine_wache(interaction: discord.Interaction):
+    today = heute_key()
+    eintrag = get_tag_eintrag(today)
+    uid = str(interaction.user.id)
+    slot = finde_slot_von_user(eintrag, uid)
+
+    if slot:
+        text = f"🟢 Du bist heute für **{slot_label(slot)}** eingetragen."
+    else:
+        text = "🔴 Du bist heute für keinen Zeitraum eingetragen."
+
+    await interaction.response.send_message(f"**Deine Routenwache ({today})**\n{text}", ephemeral=True)
 
 @tree.command(name="channels", description="Zeigt die aktuell gesetzten Channels für die Routenwache")
 @app_commands.check(ist_admin_oder_leitung)
@@ -361,10 +348,34 @@ async def channels_info(interaction: discord.Interaction):
 
     await interaction.response.send_message(
         f"**Aktuelle Einstellungen – Routenwache:**\n\n"
-        f"Routenwache:           {stempel_ch.mention        if stempel_ch        else '❌ Nicht gesetzt – /set_stempel benutzen'}\n"
-        f"Routenwache-Übersicht: {stempel_liste_ch.mention  if stempel_liste_ch  else '❌ Nicht gesetzt – /set_stempel_liste benutzen'}",
+        f"Routenwache (Buttons):  {stempel_ch.mention if stempel_ch else '❌ Nicht gesetzt – /wache_channel_setzen benutzen'}\n"
+        f"Routenwache-Übersicht:  {stempel_liste_ch.mention if stempel_liste_ch else '❌ Nicht gesetzt – /wache_liste_channel_setzen benutzen'}",
         ephemeral=True
     )
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# 🌙  TAGESWECHSEL (automatischer Reset um Mitternacht)
+# ════════════════════════════════════════════════════════════════════════════
+letzter_bekannter_tag = None
+
+@tasks.loop(seconds=30)
+async def tageswechsel_check():
+    global letzter_bekannter_tag
+    heute = heute_key()
+    if letzter_bekannter_tag != heute:
+        letzter_bekannter_tag = heute
+        for guild in bot.guilds:
+            try:
+                await refresh_wache_nachricht(guild)
+                await update_wache_liste(guild)
+                print(f"🌙 Tageswechsel erkannt, Routenwache für {heute} neu aufgesetzt.")
+            except Exception as e:
+                print(f"❌ Fehler beim Tageswechsel: {e}")
+
+@tageswechsel_check.before_loop
+async def before_tageswechsel_check():
+    await bot.wait_until_ready()
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -373,6 +384,7 @@ async def channels_info(interaction: discord.Interaction):
 
 @bot.event
 async def on_ready():
+    global letzter_bekannter_tag
     print(f"Bot online: {bot.user}")
 
     try:
@@ -389,39 +401,47 @@ async def on_ready():
     except Exception as e:
         print(f"❌ FEHLER beim Sync: {e}")
 
-    bot.add_view(StempelView())
+    bot.add_view(wache_view)
+    letzter_bekannter_tag = heute_key()
 
     for guild in bot.guilds:
         try:
-            if data.get("channel_stempel") and not data.get("stempel_nachricht_id"):
-                await stempel_posten_intern(guild)
-                print("✅ Routenwache-Nachricht nachträglich gepostet.")
-            if data.get("channel_stempel_liste"):
-                await update_stempel_liste(guild)
-                print("✅ Routenwache-Übersicht nachträglich gepostet/aktualisiert.")
+            await refresh_wache_nachricht(guild)
+            await update_wache_liste(guild)
+            print("✅ Routenwache-Nachricht/Übersicht aufgesetzt.")
         except Exception as e:
-            print(f"❌ Fehler beim Auto-Posten fehlender Nachrichten: {e}")
+            print(f"❌ Fehler beim Auto-Posten der Nachrichten: {e}")
+
+    if not tageswechsel_check.is_running():
+        tageswechsel_check.start()
 
     print("Bot ist bereit!")
 
 @bot.event
 async def on_member_remove(member: discord.Member):
-    """Entfernt automatisch den Routenwache-Eintrag eines Mitglieds,
+    """Entfernt automatisch alle Routenwache-Einträge eines Mitglieds,
     sobald es den Server verlässt (Leave oder Kick)."""
     uid = str(member.id)
-    nutzer = data.get("stempel_nutzer", {})
+    tage = data.get("tage", {})
+    geaendert = False
 
-    if uid not in nutzer:
+    for datum, eintrag in tage.items():
+        for slot, liste in eintrag.items():
+            if uid in liste:
+                liste.remove(uid)
+                geaendert = True
+
+    if not geaendert:
         return
 
-    del nutzer[uid]
     save_data(data)
-    print(f"🧹 Routenwache-Eintrag von {member} ({uid}) entfernt (Server verlassen).")
+    print(f"🧹 Routenwache-Einträge von {member} ({uid}) entfernt (Server verlassen).")
 
     try:
-        await update_stempel_liste(member.guild)
+        await refresh_wache_nachricht(member.guild)
+        await update_wache_liste(member.guild)
     except Exception as e:
-        print(f"❌ Fehler beim Aktualisieren der Übersicht nach Austritt: {e}")
+        print(f"❌ Fehler beim Aktualisieren nach Austritt: {e}")
 
 @bot.event
 async def on_app_command_error(interaction: discord.Interaction, error):
