@@ -191,7 +191,7 @@ class WacheView(discord.ui.View):
         await update_wache_liste(interaction.guild)
 
 
-wache_view = WacheView()
+wache_view: "WacheView | None" = None
 
 async def refresh_wache_nachricht(guild: discord.Guild):
     if not data.get("channel_stempel"):
@@ -384,8 +384,11 @@ async def before_tageswechsel_check():
 
 @bot.event
 async def on_ready():
-    global letzter_bekannter_tag
+    global letzter_bekannter_tag, wache_view
     print(f"Bot online: {bot.user}")
+
+    if wache_view is None:
+        wache_view = WacheView()
 
     try:
         if GUILD_ID:
