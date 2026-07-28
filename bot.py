@@ -1,7 +1,7 @@
 import discord
 from discord.ext import commands, tasks
 from discord import app_commands
-from datetime import datetime
+from datetime import datetime, time as dt_time
 import pytz
 import json
 import os
@@ -77,8 +77,8 @@ tree = bot.tree
 # 🛣️  ROUTENWACHE (Zeitraum-Anmeldung für den heutigen Tag)
 # ════════════════════════════════════════════════════════════════════════════
 # Komplett offen: es gibt hier absichtlich KEINE Rollen-/Berechtigungs-
-# einschränkung. Jedes Mitglied kann sich für einen Zeitraum ein-/austragen
-# und auch andere Mitglieder ein-/austragen.
+# einschränkung. Jedes Mitglied kann sich für einen oder mehrere Zeiträume
+# ein-/austragen und auch andere Mitglieder ein-/austragen.
 
 def heute_key() -> str:
     """Aktuelles Datum als String, z.B. '28.07.2026'."""
@@ -96,12 +96,9 @@ def get_tag_eintrag(datum: str) -> dict:
         eintrag.setdefault(slot, [])
     return eintrag
 
-def finde_slot_von_user(eintrag: dict, uid: str):
-    """Gibt den Slot zurück, in dem uid heute bereits eingetragen ist (oder None)."""
-    for slot, liste in eintrag.items():
-        if uid in liste:
-            return slot
-    return None
+def alle_slots_von_user(eintrag: dict, uid: str) -> list:
+    """Gibt ALLE Slots zurück, in denen uid heute eingetragen ist (kann mehrere sein)."""
+    return [slot for slot, liste in eintrag.items() if uid in liste]
 
 def gesamt_zeit_pro_user() -> dict:
     """Zählt für jeden User, in wie vielen Zeitraum-Slots (= Stunden) er
@@ -125,12 +122,12 @@ def build_wache_embed(datum: str, guild: discord.Guild) -> discord.Embed:
         for uid in leute:
             member = guild.get_member(int(uid)) if guild else None
             namen.append(member.mention if member else f"Unbekanntes Mitglied ({uid})")
-        text = "\n".join(namen) if namen else "*– frei –*"
+        text = "\n".join(namen) if namen else "*noch unbesetzt*"
         voll_hinweis = " 🔒 (voll)" if len(leute) >= MAX_PLAETZE_PRO_SLOT else ""
         bloecke.append(f"**{slot_label(slot)}**{voll_hinweis}\n{text}")
 
     embed.description = "\n\n".join(bloecke)
-    embed.set_footer(text="ECLIPSE – Routenwache • Klicke deinen Zeitraum an, um dich ein- oder wieder auszutragen (max. 3 Plätze pro Stunde)")
+    embed.set_footer(text="ECLIPSE – Routenwache • Klicke einen oder mehrere Zeiträume an, um dich ein- oder wieder auszutragen (max. 3 Plätze pro Stunde)")
     embed.timestamp = datetime.now(TIMEZONE)
     return embed
 
@@ -139,8 +136,10 @@ class WacheView(discord.ui.View):
     """Persistente View mit einem Button pro Zeitraum. Wird dynamisch
     neu aufgebaut, damit volle Zeiträume ausgegraut/deaktiviert sind.
 
-    Klickt man den Button des Zeitraums an, in dem man selbst schon
-    eingetragen ist, wird man automatisch wieder ausgetragen (Toggle)."""
+    Jeder Zeitraum-Button ist unabhängig: man kann sich für beliebig viele
+    Zeiträume gleichzeitig eintragen. Klickt man den Button eines Zeitraums
+    an, in dem man selbst schon eingetragen ist, wird man dort wieder
+    ausgetragen (Toggle) – die anderen Eintragungen bleiben unberührt."""
 
     def __init__(self):
         super().__init__(timeout=None)
@@ -171,12 +170,11 @@ class WacheView(discord.ui.View):
         today = heute_key()
         eintrag = get_tag_eintrag(today)
         uid = str(interaction.user.id)
+        liste = eintrag.setdefault(slot, [])
 
-        bestehender_slot = finde_slot_von_user(eintrag, uid)
-
-        # Klick auf den eigenen bereits belegten Zeitraum -> wieder austragen
-        if bestehender_slot == slot:
-            eintrag[slot].remove(uid)
+        # Bereits in DIESEM Zeitraum eingetragen -> wieder austragen
+        if uid in liste:
+            liste.remove(uid)
             save_data(data)
             self.build_buttons()
 
@@ -188,16 +186,6 @@ class WacheView(discord.ui.View):
             await update_wache_liste(interaction.guild)
             return
 
-        # Bereits in einem ANDEREN Zeitraum eingetragen
-        if bestehender_slot:
-            await interaction.response.send_message(
-                f"❌ Du bist heute schon für **{slot_label(bestehender_slot)}** eingetragen. "
-                f"Klicke erneut auf **{slot_label(bestehender_slot)}**, um dich zuerst auszutragen.",
-                ephemeral=True
-            )
-            return
-
-        liste = eintrag.setdefault(slot, [])
         if len(liste) >= MAX_PLAETZE_PRO_SLOT:
             await interaction.response.send_message(
                 "❌ Dieser Zeitraum ist leider gerade eben voll geworden. Bitte wähle einen anderen.",
@@ -315,16 +303,15 @@ async def wache_eintragen(interaction: discord.Interaction, mitglied: discord.Me
     eintrag = get_tag_eintrag(today)
     uid = str(mitglied.id)
     slot = zeitraum.value
+    liste = eintrag.setdefault(slot, [])
 
-    bestehender_slot = finde_slot_von_user(eintrag, uid)
-    if bestehender_slot:
+    if uid in liste:
         await interaction.response.send_message(
-            f"❌ {mitglied.mention} ist heute schon für **{slot_label(bestehender_slot)}** eingetragen.",
+            f"❌ {mitglied.mention} ist bereits für **{slot_label(slot)}** eingetragen.",
             ephemeral=True
         )
         return
 
-    liste = eintrag.setdefault(slot, [])
     if len(liste) >= MAX_PLAETZE_PRO_SLOT:
         await interaction.response.send_message(f"❌ **{slot_label(slot)}** ist bereits voll.", ephemeral=True)
         return
@@ -336,23 +323,34 @@ async def wache_eintragen(interaction: discord.Interaction, mitglied: discord.Me
     await refresh_wache_nachricht(interaction.guild)
     await update_wache_liste(interaction.guild)
 
-@tree.command(name="wache_austragen", description="Trägt dich (oder ein anderes Mitglied) aus der heutigen Routenwache aus")
-@app_commands.describe(mitglied="Optional: anderes Mitglied austragen (Standard: du selbst)")
-async def wache_austragen(interaction: discord.Interaction, mitglied: discord.Member = None):
+@tree.command(name="wache_austragen", description="Trägt dich (oder ein anderes Mitglied) aus einem oder allen heutigen Zeiträumen aus")
+@app_commands.describe(
+    mitglied="Optional: anderes Mitglied austragen (Standard: du selbst)",
+    zeitraum="Optional: nur aus diesem Zeitraum austragen (Standard: aus allen heutigen Zeiträumen)"
+)
+@app_commands.choices(zeitraum=WACHE_CHOICES)
+async def wache_austragen(interaction: discord.Interaction, mitglied: discord.Member = None, zeitraum: app_commands.Choice[str] = None):
     ziel = mitglied or interaction.user
     today = heute_key()
     eintrag = get_tag_eintrag(today)
     uid = str(ziel.id)
 
-    gefundener_slot = finde_slot_von_user(eintrag, uid)
-    if not gefundener_slot:
-        await interaction.response.send_message(f"❌ {ziel.mention} ist heute für keinen Zeitraum eingetragen.", ephemeral=True)
+    if zeitraum:
+        zu_entfernen = [zeitraum.value] if uid in eintrag.get(zeitraum.value, []) else []
+    else:
+        zu_entfernen = alle_slots_von_user(eintrag, uid)
+
+    if not zu_entfernen:
+        bezug = f"für **{slot_label(zeitraum.value)}**" if zeitraum else "für keinen Zeitraum"
+        await interaction.response.send_message(f"❌ {ziel.mention} ist heute {bezug} eingetragen.", ephemeral=True)
         return
 
-    eintrag[gefundener_slot].remove(uid)
+    for slot in zu_entfernen:
+        eintrag[slot].remove(uid)
     save_data(data)
 
-    await interaction.response.send_message(f"✅ {ziel.mention} wurde aus **{slot_label(gefundener_slot)}** ausgetragen.", ephemeral=True)
+    zeitraeume_text = ", ".join(f"**{slot_label(s)}**" for s in zu_entfernen)
+    await interaction.response.send_message(f"✅ {ziel.mention} wurde aus {zeitraeume_text} ausgetragen.", ephemeral=True)
     await refresh_wache_nachricht(interaction.guild)
     await update_wache_liste(interaction.guild)
 
@@ -361,10 +359,10 @@ async def meine_wache(interaction: discord.Interaction):
     today = heute_key()
     eintrag = get_tag_eintrag(today)
     uid = str(interaction.user.id)
-    slot = finde_slot_von_user(eintrag, uid)
+    slots = alle_slots_von_user(eintrag, uid)
 
-    if slot:
-        text = f"🟢 Du bist heute für **{slot_label(slot)}** eingetragen."
+    if slots:
+        text = "\n".join(f"🟢 **{slot_label(s)}**" for s in slots)
     else:
         text = "🔴 Du bist heute für keinen Zeitraum eingetragen."
 
@@ -415,23 +413,24 @@ async def channels_info(interaction: discord.Interaction):
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# 🌙  TAGESWECHSEL (automatischer Reset um Mitternacht)
+# 🌙  TAGESWECHSEL (automatischer Reset täglich um 00:01 Uhr)
 # ════════════════════════════════════════════════════════════════════════════
 letzter_bekannter_tag = None
 
-@tasks.loop(seconds=30)
+@tasks.loop(time=dt_time(hour=0, minute=1, tzinfo=TIMEZONE))
 async def tageswechsel_check():
+    """Läuft jeden Tag exakt um 00:01 Uhr (Europe/Berlin) und postet die
+    Routenwache-Nachricht/Übersicht für den neuen Tag neu."""
     global letzter_bekannter_tag
     heute = heute_key()
-    if letzter_bekannter_tag != heute:
-        letzter_bekannter_tag = heute
-        for guild in bot.guilds:
-            try:
-                await refresh_wache_nachricht(guild)
-                await update_wache_liste(guild)
-                print(f"🌙 Tageswechsel erkannt, Routenwache für {heute} neu aufgesetzt.")
-            except Exception as e:
-                print(f"❌ Fehler beim Tageswechsel: {e}")
+    letzter_bekannter_tag = heute
+    for guild in bot.guilds:
+        try:
+            await refresh_wache_nachricht(guild)
+            await update_wache_liste(guild)
+            print(f"🌙 00:01 Tageswechsel: Routenwache für {heute} neu aufgesetzt.")
+        except Exception as e:
+            print(f"❌ Fehler beim Tageswechsel: {e}")
 
 @tageswechsel_check.before_loop
 async def before_tageswechsel_check():
