@@ -103,6 +103,17 @@ def finde_slot_von_user(eintrag: dict, uid: str):
             return slot
     return None
 
+def gesamt_zeit_pro_user() -> dict:
+    """Zählt für jeden User, in wie vielen Zeitraum-Slots (= Stunden) er
+    insgesamt eingetragen war, über alle bisher gespeicherten Tage hinweg."""
+    zaehler = {}
+    tage = data.get("tage", {})
+    for datum, eintrag in tage.items():
+        for slot, liste in eintrag.items():
+            for uid in liste:
+                zaehler[uid] = zaehler.get(uid, 0) + 1
+    return zaehler
+
 def build_wache_embed(datum: str, guild: discord.Guild) -> discord.Embed:
     embed = discord.Embed(title=f"🛣️ Routenwache Heute ({datum})", color=EMBED_COLOR)
     eintrag = get_tag_eintrag(datum)
@@ -119,14 +130,17 @@ def build_wache_embed(datum: str, guild: discord.Guild) -> discord.Embed:
         bloecke.append(f"**{slot_label(slot)}**{voll_hinweis}\n{text}")
 
     embed.description = "\n\n".join(bloecke)
-    embed.set_footer(text="ECLIPSE – Routenwache • Wähle unten deinen Zeitraum (max. 3 Plätze pro Stunde)")
+    embed.set_footer(text="ECLIPSE – Routenwache • Klicke deinen Zeitraum an, um dich ein- oder wieder auszutragen (max. 3 Plätze pro Stunde)")
     embed.timestamp = datetime.now(TIMEZONE)
     return embed
 
 
 class WacheView(discord.ui.View):
     """Persistente View mit einem Button pro Zeitraum. Wird dynamisch
-    neu aufgebaut, damit volle Zeiträume ausgegraut/deaktiviert sind."""
+    neu aufgebaut, damit volle Zeiträume ausgegraut/deaktiviert sind.
+
+    Klickt man den Button des Zeitraums an, in dem man selbst schon
+    eingetragen ist, wird man automatisch wieder ausgetragen (Toggle)."""
 
     def __init__(self):
         super().__init__(timeout=None)
@@ -159,10 +173,26 @@ class WacheView(discord.ui.View):
         uid = str(interaction.user.id)
 
         bestehender_slot = finde_slot_von_user(eintrag, uid)
+
+        # Klick auf den eigenen bereits belegten Zeitraum -> wieder austragen
+        if bestehender_slot == slot:
+            eintrag[slot].remove(uid)
+            save_data(data)
+            self.build_buttons()
+
+            embed = build_wache_embed(today, interaction.guild)
+            await interaction.response.edit_message(embed=embed, view=self)
+            await interaction.followup.send(
+                f"🔴 Du wurdest aus **{slot_label(slot)}** ausgetragen.", ephemeral=True
+            )
+            await update_wache_liste(interaction.guild)
+            return
+
+        # Bereits in einem ANDEREN Zeitraum eingetragen
         if bestehender_slot:
             await interaction.response.send_message(
                 f"❌ Du bist heute schon für **{slot_label(bestehender_slot)}** eingetragen. "
-                f"Mit `/wache_austragen` kannst du dich zuerst wieder austragen.",
+                f"Klicke erneut auf **{slot_label(bestehender_slot)}**, um dich zuerst auszutragen.",
                 ephemeral=True
             )
             return
@@ -243,9 +273,9 @@ async def update_wache_liste(guild: discord.Guild):
 
 # ─── Slash-Commands ────────────────────────────────────────────────────────────
 # Hinweis: /wache_channel_setzen, /wache_liste_channel_setzen und /wache_posten
-# bleiben Admin/Leitungs-Befehle (Setup). /wache_eintragen, /wache_austragen und
-# /meine_wache haben KEINE Berechtigungs-Einschränkung – jedes Mitglied kann sie
-# nutzen (auch für andere Mitglieder).
+# bleiben Admin/Leitungs-Befehle (Setup). /wache_eintragen, /wache_austragen,
+# /meine_wache und /wache_gesamtuebersicht haben KEINE Berechtigungs-
+# Einschränkung – jedes Mitglied kann sie nutzen (auch für andere Mitglieder).
 
 @tree.command(name="wache_channel_setzen", description="Setzt den Channel für die Routenwache-Buttons")
 @app_commands.describe(channel="Der Channel wo die Zeitraum-Buttons gepostet werden")
@@ -339,6 +369,36 @@ async def meine_wache(interaction: discord.Interaction):
         text = "🔴 Du bist heute für keinen Zeitraum eingetragen."
 
     await interaction.response.send_message(f"**Deine Routenwache ({today})**\n{text}", ephemeral=True)
+
+@tree.command(name="wache_gesamtuebersicht", description="Zeigt, wer insgesamt wie viele Stunden Routenwache gemacht hat")
+async def wache_gesamtuebersicht(interaction: discord.Interaction):
+    zaehler = gesamt_zeit_pro_user()
+    if not zaehler:
+        await interaction.response.send_message("Es liegen noch keine Routenwache-Daten vor.", ephemeral=True)
+        return
+
+    sortiert = sorted(zaehler.items(), key=lambda x: x[1], reverse=True)
+
+    zeilen = []
+    for i, (uid, stunden) in enumerate(sortiert, start=1):
+        member = interaction.guild.get_member(int(uid)) if interaction.guild else None
+        name = member.mention if member else f"Unbekanntes Mitglied ({uid})"
+        zeilen.append(f"**{i}.** {name} — **{stunden}h**")
+
+    # Discord-Embed-Description ist auf 4096 Zeichen begrenzt
+    beschreibung = "\n".join(zeilen)
+    if len(beschreibung) > 4000:
+        beschreibung = beschreibung[:4000] + "\n*… (gekürzt)*"
+
+    embed = discord.Embed(
+        title="📊 Gesamtübersicht Routenwache",
+        description=beschreibung,
+        color=EMBED_COLOR
+    )
+    embed.set_footer(text="ECLIPSE – Routenwache • Summe aller Stunden über alle Tage")
+    embed.timestamp = datetime.now(TIMEZONE)
+
+    await interaction.response.send_message(embed=embed)
 
 @tree.command(name="channels", description="Zeigt die aktuell gesetzten Channels für die Routenwache")
 @app_commands.check(ist_admin_oder_leitung)
