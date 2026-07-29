@@ -48,6 +48,7 @@ STANDARD_DATEN = {
     "channel_gesamtuebersicht": None,                 # Leaderboard-Channel (/set_leaderboard)
     "gesamtuebersicht_nachricht_id": None,
     "tage": {},  # { "28.07.2026": { "20-21": ["userid", ...], "21-22": [...], ... } }
+    "globale_befehle_bereinigt": False,  # wird nach der einmaligen Bereinigung auf True gesetzt
 }
 
 def load_data() -> dict:
@@ -628,28 +629,29 @@ async def before_tageswechsel_check():
 async def sync_commands():
     """Synct die Slash-Commands.
 
-    BUGFIX: Vorher wurden bei JEDEM Bot-Start zusätzlich die globalen
-    Commands geleert und neu (leer) gesynct (`tree.clear_commands(guild=None)`
-    + `tree.sync()`). Das war ursprünglich als einmalige Aufräumaktion
-    gedacht (alte globale Befehle loswerden), lief aber bei jedem Neustart
-    erneut mit. Bei Hosting-Umgebungen mit gelegentlichen Auto-Restarts
-    (z.B. Railway/Render) kann das in kurzer Zeit gegen Discords
-    Sync-Rate-Limit laufen – die Folge: der Sync schlägt fehl und die
-    Slash-Commands verschwinden im Discord-Client oder werden nicht mehr
-    aktualisiert ("Commands gehen nicht mehr").
+    Es gibt noch alte, GLOBAL registrierte Commands aus einer früheren
+    Version des Bots (die parallel global UND pro Guild gesynct hat). Diese
+    globalen Karteileichen kollidieren mit den heutigen Guild-Commands und
+    sorgen dafür, dass im "/"-Picker Befehle doppelt auftauchen, fehlen
+    oder sich nicht auswählen lassen. Sie müssen einmalig entfernt werden
+    (`tree.clear_commands(guild=None)` + `tree.sync()`).
 
-    Jetzt läuft bei jedem Start NUR noch der schnelle, sofort wirksame
-    Guild-Sync. Die einmalige Bereinigung der alten globalen Commands läuft
-    nur noch, wenn explizit über die Umgebungsvariable CLEANUP_GLOBAL=1
-    angefordert (z.B. einmalig manuell gesetzt und danach wieder entfernt).
-    """
-    if os.environ.get("CLEANUP_GLOBAL") == "1":
+    BUGFIX: Das darf aber NICHT bei jedem Bot-Start erneut laufen – sonst
+    läuft man bei Hosting mit gelegentlichen Auto-Restarts (Railway/Render
+    etc.) schnell gegen Discords Sync-Rate-Limit, wodurch der Sync fehlschlägt
+    und die Commands ebenfalls verschwinden. Deshalb wird die Bereinigung
+    jetzt dauerhaft in data.json vermerkt (`globale_befehle_bereinigt`) und
+    läuft garantiert nur genau EIN einziges Mal – danach nie wieder, auch
+    nicht nach künftigen Neustarts."""
+    if not data.get("globale_befehle_bereinigt"):
         try:
             tree.clear_commands(guild=None)
             await tree.sync()
-            print("🧹 Alte globale Befehle bereinigt (CLEANUP_GLOBAL=1).")
+            data["globale_befehle_bereinigt"] = True
+            save_data(data)
+            print("🧹 Alte globale Befehle einmalig bereinigt.")
         except Exception as e:
-            print(f"⚠️ Konnte globale Befehle nicht bereinigen: {e}")
+            print(f"⚠️ Konnte globale Befehle nicht bereinigen (wird beim nächsten Start erneut versucht): {e}")
 
     try:
         if GUILD_ID:
