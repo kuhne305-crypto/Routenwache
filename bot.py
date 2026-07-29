@@ -345,9 +345,9 @@ def build_gesamtuebersicht_embed(guild: discord.Guild) -> discord.Embed:
             name = member.mention if member else f"Unbekanntes Mitglied ({uid})"
 
             if stunden == 0:
-                marker = " 🆘"
+                marker = "   ⚠️"
             elif stunden < schwelle:
-                marker = " ⚠️"
+                marker = "   ℹ️"
             else:
                 marker = ""
 
@@ -363,7 +363,7 @@ def build_gesamtuebersicht_embed(guild: discord.Guild) -> discord.Embed:
         description=beschreibung,
         color=EMBED_COLOR
     )
-    embed.set_footer(text="ECLIPSE – Routenwache • Summe aller abgeschlossenen Tage • 🆘 → keine Wache durchgeführt, ⚠️ → unter Durchschnitt • täglich 00:01 Uhr aktualisiert")
+    embed.set_footer(text="ECLIPSE – Routenwache • Summe aller abgeschlossenen Tage • ⚠️ → keine Wache durchgeführt, ℹ️ → unter Durchschnitt • täglich 00:01 Uhr aktualisiert")
     embed.timestamp = datetime.now(TIMEZONE)
     return embed
 
