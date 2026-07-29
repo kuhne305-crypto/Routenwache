@@ -183,7 +183,6 @@ class WacheView(discord.ui.View):
             await interaction.followup.send(
                 f"🔴 Du wurdest aus **{slot_label(slot)}** ausgetragen.", ephemeral=True
             )
-            await update_wache_liste(interaction.guild)
             return
 
         if len(liste) >= MAX_PLAETZE_PRO_SLOT:
@@ -205,8 +204,6 @@ class WacheView(discord.ui.View):
         embed = build_wache_embed(today, interaction.guild)
         await interaction.response.edit_message(embed=embed, view=self)
         await interaction.followup.send(f"🟢 Du bist eingetragen für **{slot_label(slot)}**!", ephemeral=True)
-
-        await update_wache_liste(interaction.guild)
 
 
 wache_view: "WacheView | None" = None
@@ -235,28 +232,53 @@ async def refresh_wache_nachricht(guild: discord.Guild):
     data["stempel_nachricht_id"] = str(msg.id)
     save_data(data)
 
-async def update_wache_liste(guild: discord.Guild):
+def build_tages_log_embed(datum: str, guild: discord.Guild) -> discord.Embed:
+    """Baut den Log-Embed für einen ABGESCHLOSSENEN Tag – wer war wann
+    (welcher Zeitraum) eingetragen. Wird einmal täglich um 00:01 Uhr
+    als NEUE Nachricht in den Log-Channel gepostet."""
+    embed = discord.Embed(title=f"📋 Routenwache-Log – {datum}", color=EMBED_COLOR)
+    eintrag = data.get("tage", {}).get(datum, {})
+
+    if not eintrag or not any(eintrag.get(slot) for slot in SLOTS):
+        embed.description = "*Niemand war an diesem Tag für die Routenwache eingetragen.*"
+    else:
+        bloecke = []
+        gesamt_pro_user = {}
+        for slot in SLOTS:
+            leute = eintrag.get(slot, [])
+            namen = []
+            for uid in leute:
+                member = guild.get_member(int(uid)) if guild else None
+                namen.append(member.mention if member else f"Unbekanntes Mitglied ({uid})")
+                gesamt_pro_user[uid] = gesamt_pro_user.get(uid, 0) + 1
+            text = "\n".join(namen) if namen else "*niemand*"
+            bloecke.append(f"**{slot_label(slot)}**\n{text}")
+        embed.description = "\n\n".join(bloecke)
+
+        if gesamt_pro_user:
+            sortiert = sorted(gesamt_pro_user.items(), key=lambda x: x[1], reverse=True)
+            zeilen = []
+            for uid, stunden in sortiert:
+                member = guild.get_member(int(uid)) if guild else None
+                name = member.mention if member else f"Unbekanntes Mitglied ({uid})"
+                zeilen.append(f"{name} — **{stunden}h**")
+            embed.add_field(name="⏱️ Stunden an diesem Tag", value="\n".join(zeilen), inline=False)
+
+    embed.set_footer(text="ECLIPSE – Routenwache-Log • automatisch um 00:01 Uhr gepostet")
+    embed.timestamp = datetime.now(TIMEZONE)
+    return embed
+
+async def poste_tages_log(guild: discord.Guild, datum: str):
+    """Postet den Log-Eintrag für `datum` als NEUE Nachricht in den
+    Log-Channel (kein Editieren – jeder Tag bekommt seinen eigenen Post,
+    sodass eine durchsuchbare Historie entsteht)."""
     if not data.get("channel_stempel_liste"):
         return
     kanal = guild.get_channel(int(data["channel_stempel_liste"]))
     if not kanal:
         return
-
-    today = heute_key()
-    embed = build_wache_embed(today, guild)
-
-    msg_id = data.get("stempel_liste_nachricht_id")
-    if msg_id:
-        try:
-            msg = await kanal.fetch_message(int(msg_id))
-            await msg.edit(embed=embed)
-            return
-        except Exception as e:
-            print(f"Alte Routenwache-Übersicht nicht gefunden, poste neu: {e}")
-
-    msg = await kanal.send(embed=embed)
-    data["stempel_liste_nachricht_id"] = str(msg.id)
-    save_data(data)
+    embed = build_tages_log_embed(datum, guild)
+    await kanal.send(embed=embed)
 
 
 # ─── Slash-Commands ────────────────────────────────────────────────────────────
@@ -275,22 +297,23 @@ async def wache_channel_setzen(interaction: discord.Interaction, channel: discor
     await interaction.response.send_message(f"✅ Routenwache-Channel gesetzt: {channel.mention}", ephemeral=True)
     await refresh_wache_nachricht(interaction.guild)
 
-@tree.command(name="wache_liste_channel_setzen", description="Setzt den Channel für die Routenwache-Übersicht")
-@app_commands.describe(channel="Der Channel wo die Tages-Übersicht gepostet wird")
+@tree.command(name="wache_liste_channel_setzen", description="Setzt den Channel für das tägliche Routenwache-Log (Post um 00:01 Uhr)")
+@app_commands.describe(channel="Der Channel wo täglich um 00:01 Uhr der Log-Post landet")
 @app_commands.check(ist_admin_oder_leitung)
 async def wache_liste_channel_setzen(interaction: discord.Interaction, channel: discord.TextChannel):
     data["channel_stempel_liste"] = channel.id
-    data["stempel_liste_nachricht_id"] = None
     save_data(data)
-    await interaction.response.send_message(f"✅ Routenwache-Übersicht-Channel gesetzt: {channel.mention}", ephemeral=True)
-    await update_wache_liste(interaction.guild)
+    await interaction.response.send_message(
+        f"✅ Routenwache-Log-Channel gesetzt: {channel.mention}\n"
+        f"Dort erscheint ab jetzt jeden Tag um 00:01 Uhr automatisch ein neuer Log-Post mit den Daten des Vortages.",
+        ephemeral=True
+    )
 
 @tree.command(name="wache_posten", description="Postet oder aktualisiert die Routenwache-Nachricht (Zeitraum-Buttons)")
 @app_commands.check(ist_admin_oder_leitung)
 async def wache_posten(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
     await refresh_wache_nachricht(interaction.guild)
-    await update_wache_liste(interaction.guild)
     await interaction.followup.send("✅ Routenwache-Nachricht gepostet/aktualisiert.", ephemeral=True)
 
 WACHE_CHOICES = [app_commands.Choice(name=slot_label(s), value=s) for s in SLOTS]
@@ -321,7 +344,6 @@ async def wache_eintragen(interaction: discord.Interaction, mitglied: discord.Me
 
     await interaction.response.send_message(f"✅ {mitglied.mention} wurde für **{slot_label(slot)}** eingetragen.", ephemeral=True)
     await refresh_wache_nachricht(interaction.guild)
-    await update_wache_liste(interaction.guild)
 
 @tree.command(name="wache_austragen", description="Trägt dich (oder ein anderes Mitglied) aus einem oder allen heutigen Zeiträumen aus")
 @app_commands.describe(
@@ -352,7 +374,6 @@ async def wache_austragen(interaction: discord.Interaction, mitglied: discord.Me
     zeitraeume_text = ", ".join(f"**{slot_label(s)}**" for s in zu_entfernen)
     await interaction.response.send_message(f"✅ {ziel.mention} wurde aus {zeitraeume_text} ausgetragen.", ephemeral=True)
     await refresh_wache_nachricht(interaction.guild)
-    await update_wache_liste(interaction.guild)
 
 @tree.command(name="meine_wache", description="Zeigt deinen heutigen Routenwache-Status")
 async def meine_wache(interaction: discord.Interaction):
@@ -407,7 +428,7 @@ async def channels_info(interaction: discord.Interaction):
     await interaction.response.send_message(
         f"**Aktuelle Einstellungen – Routenwache:**\n\n"
         f"Routenwache (Buttons):  {stempel_ch.mention if stempel_ch else '❌ Nicht gesetzt – /wache_channel_setzen benutzen'}\n"
-        f"Routenwache-Übersicht:  {stempel_liste_ch.mention if stempel_liste_ch else '❌ Nicht gesetzt – /wache_liste_channel_setzen benutzen'}",
+        f"Routenwache-Log (täglich 00:01 Uhr):  {stempel_liste_ch.mention if stempel_liste_ch else '❌ Nicht gesetzt – /wache_liste_channel_setzen benutzen'}",
         ephemeral=True
     )
 
@@ -419,16 +440,22 @@ letzter_bekannter_tag = None
 
 @tasks.loop(time=dt_time(hour=0, minute=1, tzinfo=TIMEZONE))
 async def tageswechsel_check():
-    """Läuft jeden Tag exakt um 00:01 Uhr (Europe/Berlin) und postet die
-    Routenwache-Nachricht/Übersicht für den neuen Tag neu."""
+    """Läuft jeden Tag exakt um 00:01 Uhr (Europe/Berlin):
+    1. Postet den Log-Eintrag für den GESTRIGEN Tag in den Log-Channel
+       (wer war wann/wie lange eingetragen) – als neue Nachricht, damit
+       im Channel eine durchsuchbare Historie entsteht.
+    2. Setzt die Routenwache-Buttons-Nachricht für den neuen Tag auf."""
     global letzter_bekannter_tag
+    vorheriger_tag = letzter_bekannter_tag
     heute = heute_key()
     letzter_bekannter_tag = heute
+
     for guild in bot.guilds:
         try:
+            if vorheriger_tag and vorheriger_tag != heute:
+                await poste_tages_log(guild, vorheriger_tag)
             await refresh_wache_nachricht(guild)
-            await update_wache_liste(guild)
-            print(f"🌙 00:01 Tageswechsel: Routenwache für {heute} neu aufgesetzt.")
+            print(f"🌙 00:01 Tageswechsel: Log für {vorheriger_tag} gepostet, Routenwache für {heute} neu aufgesetzt.")
         except Exception as e:
             print(f"❌ Fehler beim Tageswechsel: {e}")
 
@@ -469,10 +496,9 @@ async def on_ready():
     for guild in bot.guilds:
         try:
             await refresh_wache_nachricht(guild)
-            await update_wache_liste(guild)
-            print("✅ Routenwache-Nachricht/Übersicht aufgesetzt.")
+            print("✅ Routenwache-Nachricht aufgesetzt.")
         except Exception as e:
-            print(f"❌ Fehler beim Auto-Posten der Nachrichten: {e}")
+            print(f"❌ Fehler beim Auto-Posten der Nachricht: {e}")
 
     if not tageswechsel_check.is_running():
         tageswechsel_check.start()
@@ -501,7 +527,6 @@ async def on_member_remove(member: discord.Member):
 
     try:
         await refresh_wache_nachricht(member.guild)
-        await update_wache_liste(member.guild)
     except Exception as e:
         print(f"❌ Fehler beim Aktualisieren nach Austritt: {e}")
 
