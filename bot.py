@@ -152,7 +152,7 @@ def build_wache_embed(datum: str, guild: discord.Guild) -> discord.Embed:
         for uid in leute:
             member = guild.get_member(int(uid)) if guild else None
             namen.append(member.mention if member else f"Unbekanntes Mitglied ({uid})")
-        text = "\n".join(namen) if namen else "*noch unbesetzt*"
+        text = "\n".join(namen) if namen else "noch unbesetzt"
         voll_hinweis = " 🔒 (voll)" if len(leute) >= MAX_PLAETZE_PRO_SLOT else ""
         bloecke.append(f"**{slot_label(slot)}**{voll_hinweis}\n{text}")
 
@@ -285,7 +285,7 @@ def build_tages_log_embed(datum: str, guild: discord.Guild) -> discord.Embed:
     if zeilen:
         beschreibung = "\n".join(f"{i}. {zeile}" for i, zeile in enumerate(zeilen, start=1))
     else:
-        beschreibung = "*Niemand war an diesem Tag für die Routenwache eingetragen.*"
+        beschreibung = "Niemand war an diesem Tag für die Routenwache eingetragen."
 
     embed = discord.Embed(
         title=f"📋 Routenwache-Log ({datum})",
@@ -330,9 +330,9 @@ def build_gesamtuebersicht_embed(guild: discord.Guild) -> discord.Embed:
     mitglieder = rolle.members if rolle else []
 
     if not rolle:
-        beschreibung = "*Die Routenwache-Rolle wurde auf dem Server nicht gefunden.*"
+        beschreibung = "Die Routenwache-Rolle wurde auf dem Server nicht gefunden."
     elif not mitglieder:
-        beschreibung = "*Niemand hat aktuell die Routenwache-Rolle.*"
+        beschreibung = "Niemand hat aktuell die Routenwache-Rolle."
     else:
         eintraege = {str(m.id): zaehler.get(str(m.id), 0) for m in mitglieder}
         durchschnitt = sum(eintraege.values()) / len(eintraege)
@@ -345,9 +345,9 @@ def build_gesamtuebersicht_embed(guild: discord.Guild) -> discord.Embed:
             name = member.mention if member else f"Unbekanntes Mitglied ({uid})"
 
             if stunden == 0:
-                marker = " 🆘 *noch nie dabei*"
+                marker = " 🆘"
             elif stunden < schwelle:
-                marker = " ⚠️ *bald dran*"
+                marker = " ⚠️"
             else:
                 marker = ""
 
@@ -356,14 +356,14 @@ def build_gesamtuebersicht_embed(guild: discord.Guild) -> discord.Embed:
         # Discord-Embed-Description ist auf 4096 Zeichen begrenzt
         beschreibung = "\n".join(zeilen)
         if len(beschreibung) > 4000:
-            beschreibung = beschreibung[:4000] + "\n*… (gekürzt)*"
+            beschreibung = beschreibung[:4000] + "\n… (gekürzt)"
 
     embed = discord.Embed(
         title="📊 Gesamtübersicht Routenwache",
         description=beschreibung,
         color=EMBED_COLOR
     )
-    embed.set_footer(text="ECLIPSE – Routenwache • Summe aller abgeschlossenen Tage • 🆘 = 0h, ⚠️ = unter halbem Durchschnitt • täglich 00:01 Uhr aktualisiert")
+    embed.set_footer(text="ECLIPSE – Routenwache • Summe aller abgeschlossenen Tage • 🆘 → keine Wache durchgeführt, ⚠️ → unter Durchschnitt • täglich 00:01 Uhr aktualisiert")
     embed.timestamp = datetime.now(TIMEZONE)
     return embed
 
