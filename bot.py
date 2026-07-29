@@ -47,6 +47,8 @@ def load_data():
         "stempel_nachricht_id": None,
         "channel_stempel_liste": 1531376274130341909,
         "stempel_liste_nachricht_id": None,
+        "channel_gesamtuebersicht": None,
+        "gesamtuebersicht_nachricht_id": None,
         "tage": {},  # { "28.07.2026": { "20-21": ["userid", ...], "21-22": [...], ... } }
     }
     if not geladen:
@@ -190,6 +192,7 @@ class WacheView(discord.ui.View):
             await interaction.followup.send(
                 f"🔴 Du wurdest aus **{slot_label(slot)}** ausgetragen.", ephemeral=True
             )
+            await refresh_gesamtuebersicht(interaction.guild)
             return
 
         if len(liste) >= MAX_PLAETZE_PRO_SLOT:
@@ -211,6 +214,7 @@ class WacheView(discord.ui.View):
         embed = build_wache_embed(today, interaction.guild)
         await interaction.response.edit_message(embed=embed, view=self)
         await interaction.followup.send(f"🟢 Du bist eingetragen für **{slot_label(slot)}**!", ephemeral=True)
+        await refresh_gesamtuebersicht(interaction.guild)
 
 
 wache_view: "WacheView | None" = None
@@ -345,6 +349,7 @@ async def wache_eintragen(interaction: discord.Interaction, mitglied: discord.Me
 
     await interaction.response.send_message(f"✅ {mitglied.mention} wurde für **{slot_label(slot)}** eingetragen.", ephemeral=True)
     await refresh_wache_nachricht(interaction.guild)
+    await refresh_gesamtuebersicht(interaction.guild)
 
 @tree.command(name="wache_nachtragen", description="Trägt ein Mitglied nachträglich für einen VERGANGENEN Tag/Zeitraum ein")
 @app_commands.describe(
@@ -390,6 +395,7 @@ async def wache_nachtragen(interaction: discord.Interaction, mitglied: discord.M
     # Wenn es sich um den heutigen Tag handelt, auch die Live-Buttons-Nachricht aktualisieren
     if tag == heute_key():
         await refresh_wache_nachricht(interaction.guild)
+    await refresh_gesamtuebersicht(interaction.guild)
 
 @tree.command(name="wache_austragen", description="Trägt dich (oder ein anderes Mitglied) aus einem oder allen Zeiträumen aus – heute oder an einem vergangenen Tag")
 @app_commands.describe(
@@ -434,6 +440,64 @@ async def wache_austragen(interaction: discord.Interaction, mitglied: discord.Me
 
     if tag == heute_key():
         await refresh_wache_nachricht(interaction.guild)
+    await refresh_gesamtuebersicht(interaction.guild)
+
+def build_gesamtuebersicht_embed(guild: discord.Guild) -> discord.Embed:
+    """Baut das Ranking 'wer hat insgesamt wie viele Stunden Routenwache
+    gemacht' – wird sowohl vom /wache_gesamtuebersicht-Befehl als auch
+    für den live aktualisierten Gesamtübersicht-Channel verwendet."""
+    zaehler = gesamt_zeit_pro_user()
+
+    if not zaehler:
+        beschreibung = "*Es liegen noch keine Routenwache-Daten vor.*"
+    else:
+        sortiert = sorted(zaehler.items(), key=lambda x: x[1], reverse=True)
+        zeilen = []
+        for i, (uid, stunden) in enumerate(sortiert, start=1):
+            member = guild.get_member(int(uid)) if guild else None
+            name = member.mention if member else f"Unbekanntes Mitglied ({uid})"
+            zeilen.append(f"**{i}.** {name} — **{stunden}h**")
+
+        # Discord-Embed-Description ist auf 4096 Zeichen begrenzt
+        beschreibung = "\n".join(zeilen)
+        if len(beschreibung) > 4000:
+            beschreibung = beschreibung[:4000] + "\n*… (gekürzt)*"
+
+    embed = discord.Embed(
+        title="📊 Gesamtübersicht Routenwache",
+        description=beschreibung,
+        color=EMBED_COLOR
+    )
+    embed.set_footer(text="ECLIPSE – Routenwache • Summe aller Stunden über alle Tage • wird laufend aktualisiert")
+    embed.timestamp = datetime.now(TIMEZONE)
+    return embed
+
+async def refresh_gesamtuebersicht(guild: discord.Guild):
+    """Editiert (oder postet erstmalig) die EINE Gesamtübersicht-Nachricht
+    im dafür gesetzten Channel. Wird nach JEDER Änderung (Ein-/Austragen,
+    Nachtragen, Austritt, Tageswechsel) aufgerufen, damit der Channel
+    immer den aktuellen Stand zeigt – ganz ohne Befehl."""
+    if not data.get("channel_gesamtuebersicht"):
+        return
+    kanal = guild.get_channel(int(data["channel_gesamtuebersicht"]))
+    if not kanal:
+        return
+
+    embed = build_gesamtuebersicht_embed(guild)
+
+    msg_id = data.get("gesamtuebersicht_nachricht_id")
+    if msg_id:
+        try:
+            msg = await kanal.fetch_message(int(msg_id))
+            await msg.edit(embed=embed)
+            return
+        except Exception as e:
+            print(f"Alte Gesamtübersicht-Nachricht nicht gefunden, poste neu: {e}")
+
+    msg = await kanal.send(embed=embed)
+    data["gesamtuebersicht_nachricht_id"] = str(msg.id)
+    save_data(data)
+
 
 @tree.command(name="meine_wache", description="Zeigt deinen heutigen Routenwache-Status")
 async def meine_wache(interaction: discord.Interaction):
@@ -451,43 +515,34 @@ async def meine_wache(interaction: discord.Interaction):
 
 @tree.command(name="wache_gesamtuebersicht", description="Zeigt, wer insgesamt wie viele Stunden Routenwache gemacht hat")
 async def wache_gesamtuebersicht(interaction: discord.Interaction):
-    zaehler = gesamt_zeit_pro_user()
-    if not zaehler:
-        await interaction.response.send_message("Es liegen noch keine Routenwache-Daten vor.", ephemeral=True)
-        return
-
-    sortiert = sorted(zaehler.items(), key=lambda x: x[1], reverse=True)
-
-    zeilen = []
-    for i, (uid, stunden) in enumerate(sortiert, start=1):
-        member = interaction.guild.get_member(int(uid)) if interaction.guild else None
-        name = member.mention if member else f"Unbekanntes Mitglied ({uid})"
-        zeilen.append(f"**{i}.** {name} — **{stunden}h**")
-
-    # Discord-Embed-Description ist auf 4096 Zeichen begrenzt
-    beschreibung = "\n".join(zeilen)
-    if len(beschreibung) > 4000:
-        beschreibung = beschreibung[:4000] + "\n*… (gekürzt)*"
-
-    embed = discord.Embed(
-        title="📊 Gesamtübersicht Routenwache",
-        description=beschreibung,
-        color=EMBED_COLOR
-    )
-    embed.set_footer(text="ECLIPSE – Routenwache • Summe aller Stunden über alle Tage")
-    embed.timestamp = datetime.now(TIMEZONE)
-
+    embed = build_gesamtuebersicht_embed(interaction.guild)
     await interaction.response.send_message(embed=embed)
+
+@tree.command(name="wache_gesamtuebersicht_channel_setzen", description="Setzt den Channel für die live aktualisierte Gesamtübersicht")
+@app_commands.describe(channel="Der Channel, in dem die Gesamtübersicht laufend aktualisiert wird")
+@app_commands.check(ist_admin_oder_leitung)
+async def wache_gesamtuebersicht_channel_setzen(interaction: discord.Interaction, channel: discord.TextChannel):
+    data["channel_gesamtuebersicht"] = channel.id
+    data["gesamtuebersicht_nachricht_id"] = None
+    save_data(data)
+    await interaction.response.send_message(
+        f"✅ Gesamtübersicht-Channel gesetzt: {channel.mention}\n"
+        f"Dort erscheint jetzt eine Nachricht, die sich automatisch bei jeder Änderung aktualisiert.",
+        ephemeral=True
+    )
+    await refresh_gesamtuebersicht(interaction.guild)
 
 @tree.command(name="channels", description="Zeigt die aktuell gesetzten Channels für die Routenwache")
 @app_commands.check(ist_admin_oder_leitung)
 async def channels_info(interaction: discord.Interaction):
     stempel_ch = interaction.guild.get_channel(int(data["channel_stempel"])) if data.get("channel_stempel") else None
     stempel_liste_ch = interaction.guild.get_channel(int(data["channel_stempel_liste"])) if data.get("channel_stempel_liste") else None
+    gesamt_ch = interaction.guild.get_channel(int(data["channel_gesamtuebersicht"])) if data.get("channel_gesamtuebersicht") else None
 
     await interaction.response.send_message(
         f"**Aktuelle Einstellungen – Routenwache:**\n\n"
         f"Routenwache (Buttons):  {stempel_ch.mention if stempel_ch else '❌ Nicht gesetzt – /wache_channel_setzen benutzen'}\n"
+        f"Gesamtübersicht (live, laufend aktualisiert):  {gesamt_ch.mention if gesamt_ch else '❌ Nicht gesetzt – /wache_gesamtuebersicht_channel_setzen benutzen'}\n"
         f"Routenwache-Log (täglich 00:01 Uhr):  {stempel_liste_ch.mention if stempel_liste_ch else '❌ Nicht gesetzt – /wache_liste_channel_setzen benutzen'}",
         ephemeral=True
     )
@@ -504,7 +559,8 @@ async def tageswechsel_check():
     1. Postet den Log-Eintrag für den GESTRIGEN Tag in den Log-Channel
        (wer war wann/wie lange eingetragen) – als neue Nachricht, damit
        im Channel eine durchsuchbare Historie entsteht.
-    2. Setzt die Routenwache-Buttons-Nachricht für den neuen Tag auf."""
+    2. Setzt die Routenwache-Buttons-Nachricht für den neuen Tag auf.
+    3. Aktualisiert die live Gesamtübersicht."""
     global letzter_bekannter_tag
     vorheriger_tag = letzter_bekannter_tag
     heute = heute_key()
@@ -515,6 +571,7 @@ async def tageswechsel_check():
             if vorheriger_tag and vorheriger_tag != heute:
                 await poste_tages_log(guild, vorheriger_tag)
             await refresh_wache_nachricht(guild)
+            await refresh_gesamtuebersicht(guild)
             print(f"🌙 00:01 Tageswechsel: Log für {vorheriger_tag} gepostet, Routenwache für {heute} neu aufgesetzt.")
         except Exception as e:
             print(f"❌ Fehler beim Tageswechsel: {e}")
@@ -556,7 +613,8 @@ async def on_ready():
     for guild in bot.guilds:
         try:
             await refresh_wache_nachricht(guild)
-            print("✅ Routenwache-Nachricht aufgesetzt.")
+            await refresh_gesamtuebersicht(guild)
+            print("✅ Routenwache-Nachricht & Gesamtübersicht aufgesetzt.")
         except Exception as e:
             print(f"❌ Fehler beim Auto-Posten der Nachricht: {e}")
 
@@ -587,6 +645,7 @@ async def on_member_remove(member: discord.Member):
 
     try:
         await refresh_wache_nachricht(member.guild)
+        await refresh_gesamtuebersicht(member.guild)
     except Exception as e:
         print(f"❌ Fehler beim Aktualisieren nach Austritt: {e}")
 
