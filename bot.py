@@ -532,8 +532,11 @@ async def wache_austragen(interaction: discord.Interaction, mitglied: discord.Me
         zu_entfernen = alle_slots_von_user(eintrag, uid)
 
     if not zu_entfernen:
+        # BUGFIX: Hier fehlte zuvor die Verneinung ("nicht") – die Meldung
+        # behauptete fälschlicherweise, die Person SEI eingetragen, obwohl
+        # dieser Zweig genau dann läuft, wenn sie es NICHT ist.
         bezug = f"für **{slot_label(zeitraum.value)}**" if zeitraum else "für keinen Zeitraum"
-        await interaction.response.send_message(f"❌ {ziel.mention} ist am **{tag}** {bezug} eingetragen.", ephemeral=True)
+        await interaction.response.send_message(f"❌ {ziel.mention} ist am **{tag}** nicht {bezug} eingetragen.", ephemeral=True)
         return
 
     for slot in zu_entfernen:
@@ -623,24 +626,30 @@ async def before_tageswechsel_check():
 # ════════════════════════════════════════════════════════════════════════════
 
 async def sync_commands():
-    """Synct die Slash-Commands. Wichtig für saubere/aktuelle Befehle:
+    """Synct die Slash-Commands.
 
-    1. GLOBALE Befehle werden zuerst komplett gelöscht (leer gesynct).
-       Grund: frühere Versionen dieses Bots haben sowohl Guild- als auch
-       global gesynct. Globale Änderungen brauchen aber bis zu 1 Stunde,
-       um bei Discord zu propagieren – dadurch blieben umbenannte/alte
-       Befehle im Client sichtbar ("veraltete Befehle"). Indem wir NUR
-       noch guild-spezifisch synden, sind Änderungen sofort sichtbar,
-       und die alten globalen Karteileichen werden hier einmalig entfernt.
-    2. Danach werden die aktuellen Befehle NUR auf die eine Guild (GUILD_ID)
-       gesynct – das ist sofort wirksam, kein Warten nötig.
+    BUGFIX: Vorher wurden bei JEDEM Bot-Start zusätzlich die globalen
+    Commands geleert und neu (leer) gesynct (`tree.clear_commands(guild=None)`
+    + `tree.sync()`). Das war ursprünglich als einmalige Aufräumaktion
+    gedacht (alte globale Befehle loswerden), lief aber bei jedem Neustart
+    erneut mit. Bei Hosting-Umgebungen mit gelegentlichen Auto-Restarts
+    (z.B. Railway/Render) kann das in kurzer Zeit gegen Discords
+    Sync-Rate-Limit laufen – die Folge: der Sync schlägt fehl und die
+    Slash-Commands verschwinden im Discord-Client oder werden nicht mehr
+    aktualisiert ("Commands gehen nicht mehr").
+
+    Jetzt läuft bei jedem Start NUR noch der schnelle, sofort wirksame
+    Guild-Sync. Die einmalige Bereinigung der alten globalen Commands läuft
+    nur noch, wenn explizit über die Umgebungsvariable CLEANUP_GLOBAL=1
+    angefordert (z.B. einmalig manuell gesetzt und danach wieder entfernt).
     """
-    try:
-        tree.clear_commands(guild=None)
-        await tree.sync()
-        print("🧹 Alte globale Befehle bereinigt.")
-    except Exception as e:
-        print(f"⚠️ Konnte globale Befehle nicht bereinigen: {e}")
+    if os.environ.get("CLEANUP_GLOBAL") == "1":
+        try:
+            tree.clear_commands(guild=None)
+            await tree.sync()
+            print("🧹 Alte globale Befehle bereinigt (CLEANUP_GLOBAL=1).")
+        except Exception as e:
+            print(f"⚠️ Konnte globale Befehle nicht bereinigen: {e}")
 
     try:
         if GUILD_ID:
@@ -651,6 +660,8 @@ async def sync_commands():
         else:
             synced = await tree.sync()
             print(f"⚠️ Keine GUILD_ID gesetzt — {len(synced)} Commands global gesynct (kann bis zu 1h dauern).")
+    except discord.HTTPException as e:
+        print(f"❌ FEHLER beim Sync (evtl. Discord-Rate-Limit): {e}")
     except Exception as e:
         print(f"❌ FEHLER beim Sync: {e}")
 
@@ -684,23 +695,30 @@ async def on_ready():
 
 @bot.event
 async def on_member_remove(member: discord.Member):
-    """Entfernt automatisch alle Routenwache-Einträge eines Mitglieds,
-    sobald es den Server verlässt (Leave oder Kick)."""
+    """Entfernt automatisch die HEUTIGEN Routenwache-Einträge eines
+    Mitglieds, sobald es den Server verlässt (Leave oder Kick).
+
+    BUGFIX: Vorher wurden die Einträge über ALLE Tage entfernt – auch
+    bereits abgeschlossene, die schon in die Gesamtübersicht (Leaderboard)
+    eingeflossen waren. Verließ jemand den Server, verschwanden damit
+    rückwirkend seine bereits "verdienten" Stunden aus der Statistik.
+    Jetzt wird nur noch der laufende, heutige Tag bereinigt (macht Sinn,
+    weil man ja nicht mehr da ist, um die Schicht anzutreten) –
+    abgeschlossene Tage bleiben unangetastet."""
     uid = str(member.id)
-    tage = data.get("tage", {})
+    eintrag = data.get("tage", {}).get(heute_key(), {})
     geaendert = False
 
-    for datum, eintrag in tage.items():
-        for slot, liste in eintrag.items():
-            if uid in liste:
-                liste.remove(uid)
-                geaendert = True
+    for slot, liste in eintrag.items():
+        if uid in liste:
+            liste.remove(uid)
+            geaendert = True
 
     if not geaendert:
         return
 
     save_data(data)
-    print(f"🧹 Routenwache-Einträge von {member} ({uid}) entfernt (Server verlassen).")
+    print(f"🧹 Heutige Routenwache-Einträge von {member} ({uid}) entfernt (Server verlassen).")
 
     try:
         await refresh_wache_nachricht(member.guild)
