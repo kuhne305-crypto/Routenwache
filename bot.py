@@ -44,8 +44,8 @@ def ist_admin_oder_leitung(interaction: discord.Interaction) -> bool:
 STANDARD_DATEN = {
     "channel_stempel": 1531376112226140260,          # Buttons-Channel (Eintragen)
     "stempel_nachricht_id": None,
-    "channel_stempel_liste": 1531376274130341909,     # Log-Channel (täglicher Post um 00:01 Uhr)
-    "channel_gesamtuebersicht": None,                 # Leaderboard-Channel (/set_leaderboard)
+    "channel_stempel_liste": 1531844980098732093,     # Log-Channel (täglicher Post um 00:01 Uhr)
+    "channel_gesamtuebersicht": 1531376274130341909,  # Leaderboard-Channel (/set_leaderboard)
     "gesamtuebersicht_nachricht_id": None,
     "tage": {},  # { "28.07.2026": { "20-21": ["userid", ...], "21-22": [...], ... } }
     "globale_befehle_bereinigt": False,  # wird nach der einmaligen Bereinigung auf True gesetzt
