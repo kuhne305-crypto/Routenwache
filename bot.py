@@ -629,30 +629,17 @@ async def before_tageswechsel_check():
 async def sync_commands():
     """Synct die Slash-Commands.
 
-    Es gibt noch alte, GLOBAL registrierte Commands aus einer früheren
-    Version des Bots (die parallel global UND pro Guild gesynct hat). Diese
-    globalen Karteileichen kollidieren mit den heutigen Guild-Commands und
-    sorgen dafür, dass im "/"-Picker Befehle doppelt auftauchen, fehlen
-    oder sich nicht auswählen lassen. Sie müssen einmalig entfernt werden
-    (`tree.clear_commands(guild=None)` + `tree.sync()`).
+    KRITISCHER BUGFIX: Vorher wurde ZUERST `tree.clear_commands(guild=None)`
+    aufgerufen. Das leert aber nicht nur die Commands auf Discords Seite,
+    sondern auch die lokale Command-Liste im `tree`-Objekt selbst. Der
+    darauffolgende Aufruf `tree.copy_global_to(guild=...)` kopiert die
+    Commands aus genau dieser (jetzt leeren!) lokalen Liste in die Guild –
+    das Ergebnis war, dass in der Guild am Ende GAR KEINE Commands mehr
+    ankamen. Das erklärt "Bot ist online, aber kein Command eingebbar".
 
-    BUGFIX: Das darf aber NICHT bei jedem Bot-Start erneut laufen – sonst
-    läuft man bei Hosting mit gelegentlichen Auto-Restarts (Railway/Render
-    etc.) schnell gegen Discords Sync-Rate-Limit, wodurch der Sync fehlschlägt
-    und die Commands ebenfalls verschwinden. Deshalb wird die Bereinigung
-    jetzt dauerhaft in data.json vermerkt (`globale_befehle_bereinigt`) und
-    läuft garantiert nur genau EIN einziges Mal – danach nie wieder, auch
-    nicht nach künftigen Neustarts."""
-    if not data.get("globale_befehle_bereinigt"):
-        try:
-            tree.clear_commands(guild=None)
-            await tree.sync()
-            data["globale_befehle_bereinigt"] = True
-            save_data(data)
-            print("🧹 Alte globale Befehle einmalig bereinigt.")
-        except Exception as e:
-            print(f"⚠️ Konnte globale Befehle nicht bereinigen (wird beim nächsten Start erneut versucht): {e}")
-
+    Jetzt läuft zuerst der Guild-Sync (solange die lokale Command-Liste
+    noch vollständig ist), und erst DANACH – und nur einmalig, dauerhaft
+    in data.json vermerkt – die Bereinigung der alten globalen Reste."""
     try:
         if GUILD_ID:
             guild_obj = discord.Object(id=int(GUILD_ID))
@@ -663,9 +650,19 @@ async def sync_commands():
             synced = await tree.sync()
             print(f"⚠️ Keine GUILD_ID gesetzt — {len(synced)} Commands global gesynct (kann bis zu 1h dauern).")
     except discord.HTTPException as e:
-        print(f"❌ FEHLER beim Sync (evtl. Discord-Rate-Limit): {e}")
+        print(f"❌ FEHLER beim Guild-Sync (evtl. Discord-Rate-Limit): {e}")
     except Exception as e:
-        print(f"❌ FEHLER beim Sync: {e}")
+        print(f"❌ FEHLER beim Guild-Sync: {e}")
+
+    if not data.get("globale_befehle_bereinigt"):
+        try:
+            tree.clear_commands(guild=None)
+            await tree.sync()
+            data["globale_befehle_bereinigt"] = True
+            save_data(data)
+            print("🧹 Alte globale Befehle einmalig bereinigt.")
+        except Exception as e:
+            print(f"⚠️ Konnte globale Befehle nicht bereinigen (wird beim nächsten Start erneut versucht): {e}")
 
 
 @bot.event
