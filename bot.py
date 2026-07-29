@@ -84,6 +84,13 @@ def heute_key() -> str:
     """Aktuelles Datum als String, z.B. '28.07.2026'."""
     return datetime.now(TIMEZONE).strftime("%d.%m.%Y")
 
+def parse_datum(datum_str: str) -> str:
+    """Validiert eine Nutzereingabe im Format TT.MM.JJJJ und gibt sie
+    normalisiert zurück (z.B. '3.7.2026' -> '03.07.2026').
+    Wirft ValueError bei ungültigem Format."""
+    geparst = datetime.strptime(datum_str.strip(), "%d.%m.%Y")
+    return geparst.strftime("%d.%m.%Y")
+
 def slot_label(slot: str) -> str:
     start, ende = slot.split("-")
     return f"{start} - {ende} Uhr"
@@ -235,36 +242,29 @@ async def refresh_wache_nachricht(guild: discord.Guild):
 def build_tages_log_embed(datum: str, guild: discord.Guild) -> discord.Embed:
     """Baut den Log-Embed für einen ABGESCHLOSSENEN Tag – wer war wann
     (welcher Zeitraum) eingetragen. Wird einmal täglich um 00:01 Uhr
-    als NEUE Nachricht in den Log-Channel gepostet."""
-    embed = discord.Embed(title=f"📋 Routenwache-Log – {datum}", color=EMBED_COLOR)
+    als NEUE Nachricht in den Log-Channel gepostet. Format wie die
+    Gesamtübersicht: eine kompakte nummerierte Liste, hier aber
+    'wer war wann eingetragen' statt Gesamtstunden."""
     eintrag = data.get("tage", {}).get(datum, {})
 
-    if not eintrag or not any(eintrag.get(slot) for slot in SLOTS):
-        embed.description = "*Niemand war an diesem Tag für die Routenwache eingetragen.*"
+    zeilen = []
+    for slot in SLOTS:
+        for uid in eintrag.get(slot, []):
+            member = guild.get_member(int(uid)) if guild else None
+            name = member.mention if member else f"Unbekanntes Mitglied ({uid})"
+            zeilen.append(f"{name} — **{slot_label(slot)}**")
+
+    if zeilen:
+        beschreibung = "\n".join(f"{i}. {zeile}" for i, zeile in enumerate(zeilen, start=1))
     else:
-        bloecke = []
-        gesamt_pro_user = {}
-        for slot in SLOTS:
-            leute = eintrag.get(slot, [])
-            namen = []
-            for uid in leute:
-                member = guild.get_member(int(uid)) if guild else None
-                namen.append(member.mention if member else f"Unbekanntes Mitglied ({uid})")
-                gesamt_pro_user[uid] = gesamt_pro_user.get(uid, 0) + 1
-            text = "\n".join(namen) if namen else "*niemand*"
-            bloecke.append(f"**{slot_label(slot)}**\n{text}")
-        embed.description = "\n\n".join(bloecke)
+        beschreibung = "*Niemand war an diesem Tag für die Routenwache eingetragen.*"
 
-        if gesamt_pro_user:
-            sortiert = sorted(gesamt_pro_user.items(), key=lambda x: x[1], reverse=True)
-            zeilen = []
-            for uid, stunden in sortiert:
-                member = guild.get_member(int(uid)) if guild else None
-                name = member.mention if member else f"Unbekanntes Mitglied ({uid})"
-                zeilen.append(f"{name} — **{stunden}h**")
-            embed.add_field(name="⏱️ Stunden an diesem Tag", value="\n".join(zeilen), inline=False)
-
-    embed.set_footer(text="ECLIPSE – Routenwache-Log • automatisch um 00:01 Uhr gepostet")
+    embed = discord.Embed(
+        title=f"📋 Routenwache-Log ({datum})",
+        description=beschreibung,
+        color=EMBED_COLOR
+    )
+    embed.set_footer(text="ECLIPSE – Routenwache-Log • wer wann eingetragen war")
     embed.timestamp = datetime.now(TIMEZONE)
     return embed
 
@@ -282,10 +282,11 @@ async def poste_tages_log(guild: discord.Guild, datum: str):
 
 
 # ─── Slash-Commands ────────────────────────────────────────────────────────────
-# Hinweis: /wache_channel_setzen, /wache_liste_channel_setzen und /wache_posten
-# bleiben Admin/Leitungs-Befehle (Setup). /wache_eintragen, /wache_austragen,
-# /meine_wache und /wache_gesamtuebersicht haben KEINE Berechtigungs-
-# Einschränkung – jedes Mitglied kann sie nutzen (auch für andere Mitglieder).
+# Hinweis: /wache_channel_setzen, /wache_liste_channel_setzen, /wache_posten und
+# /wache_nachtragen bleiben Admin/Leitungs-Befehle (Setup bzw. rückwirkende
+# Korrekturen). /wache_eintragen, /wache_austragen, /meine_wache und
+# /wache_gesamtuebersicht haben KEINE Berechtigungs-Einschränkung – jedes
+# Mitglied kann sie nutzen (auch für andere Mitglieder, jeweils nur für heute).
 
 @tree.command(name="wache_channel_setzen", description="Setzt den Channel für die Routenwache-Buttons")
 @app_commands.describe(channel="Der Channel wo die Zeitraum-Buttons gepostet werden")
@@ -345,16 +346,73 @@ async def wache_eintragen(interaction: discord.Interaction, mitglied: discord.Me
     await interaction.response.send_message(f"✅ {mitglied.mention} wurde für **{slot_label(slot)}** eingetragen.", ephemeral=True)
     await refresh_wache_nachricht(interaction.guild)
 
-@tree.command(name="wache_austragen", description="Trägt dich (oder ein anderes Mitglied) aus einem oder allen heutigen Zeiträumen aus")
+@tree.command(name="wache_nachtragen", description="Trägt ein Mitglied nachträglich für einen VERGANGENEN Tag/Zeitraum ein")
 @app_commands.describe(
-    mitglied="Optional: anderes Mitglied austragen (Standard: du selbst)",
-    zeitraum="Optional: nur aus diesem Zeitraum austragen (Standard: aus allen heutigen Zeiträumen)"
+    mitglied="Das Mitglied",
+    datum="Datum im Format TT.MM.JJJJ (z.B. 27.07.2026)",
+    zeitraum="Der Zeitraum"
 )
 @app_commands.choices(zeitraum=WACHE_CHOICES)
-async def wache_austragen(interaction: discord.Interaction, mitglied: discord.Member = None, zeitraum: app_commands.Choice[str] = None):
+@app_commands.check(ist_admin_oder_leitung)
+async def wache_nachtragen(interaction: discord.Interaction, mitglied: discord.Member, datum: str, zeitraum: app_commands.Choice[str]):
+    try:
+        tag = parse_datum(datum)
+    except ValueError:
+        await interaction.response.send_message(
+            "❌ Ungültiges Datum. Bitte im Format **TT.MM.JJJJ** angeben (z.B. `27.07.2026`).", ephemeral=True
+        )
+        return
+
+    eintrag = get_tag_eintrag(tag)
+    uid = str(mitglied.id)
+    slot = zeitraum.value
+    liste = eintrag.setdefault(slot, [])
+
+    if uid in liste:
+        await interaction.response.send_message(
+            f"❌ {mitglied.mention} ist für **{tag} — {slot_label(slot)}** bereits eingetragen.", ephemeral=True
+        )
+        return
+
+    if len(liste) >= MAX_PLAETZE_PRO_SLOT:
+        await interaction.response.send_message(
+            f"❌ **{tag} — {slot_label(slot)}** ist bereits voll ({MAX_PLAETZE_PRO_SLOT}/{MAX_PLAETZE_PRO_SLOT}).", ephemeral=True
+        )
+        return
+
+    liste.append(uid)
+    save_data(data)
+
+    await interaction.response.send_message(
+        f"✅ {mitglied.mention} wurde nachträglich für **{tag} — {slot_label(slot)}** eingetragen.", ephemeral=True
+    )
+
+    # Wenn es sich um den heutigen Tag handelt, auch die Live-Buttons-Nachricht aktualisieren
+    if tag == heute_key():
+        await refresh_wache_nachricht(interaction.guild)
+
+@tree.command(name="wache_austragen", description="Trägt dich (oder ein anderes Mitglied) aus einem oder allen Zeiträumen aus – heute oder an einem vergangenen Tag")
+@app_commands.describe(
+    mitglied="Optional: anderes Mitglied austragen (Standard: du selbst)",
+    zeitraum="Optional: nur aus diesem Zeitraum austragen (Standard: aus allen Zeiträumen des Tages)",
+    datum="Optional: Datum im Format TT.MM.JJJJ, um einen vergangenen Tag zu korrigieren (Standard: heute)"
+)
+@app_commands.choices(zeitraum=WACHE_CHOICES)
+async def wache_austragen(interaction: discord.Interaction, mitglied: discord.Member = None, zeitraum: app_commands.Choice[str] = None, datum: str = None):
     ziel = mitglied or interaction.user
-    today = heute_key()
-    eintrag = get_tag_eintrag(today)
+
+    if datum:
+        try:
+            tag = parse_datum(datum)
+        except ValueError:
+            await interaction.response.send_message(
+                "❌ Ungültiges Datum. Bitte im Format **TT.MM.JJJJ** angeben (z.B. `27.07.2026`).", ephemeral=True
+            )
+            return
+    else:
+        tag = heute_key()
+
+    eintrag = get_tag_eintrag(tag)
     uid = str(ziel.id)
 
     if zeitraum:
@@ -364,7 +422,7 @@ async def wache_austragen(interaction: discord.Interaction, mitglied: discord.Me
 
     if not zu_entfernen:
         bezug = f"für **{slot_label(zeitraum.value)}**" if zeitraum else "für keinen Zeitraum"
-        await interaction.response.send_message(f"❌ {ziel.mention} ist heute {bezug} eingetragen.", ephemeral=True)
+        await interaction.response.send_message(f"❌ {ziel.mention} ist am **{tag}** {bezug} eingetragen.", ephemeral=True)
         return
 
     for slot in zu_entfernen:
@@ -372,8 +430,10 @@ async def wache_austragen(interaction: discord.Interaction, mitglied: discord.Me
     save_data(data)
 
     zeitraeume_text = ", ".join(f"**{slot_label(s)}**" for s in zu_entfernen)
-    await interaction.response.send_message(f"✅ {ziel.mention} wurde aus {zeitraeume_text} ausgetragen.", ephemeral=True)
-    await refresh_wache_nachricht(interaction.guild)
+    await interaction.response.send_message(f"✅ {ziel.mention} wurde am **{tag}** aus {zeitraeume_text} ausgetragen.", ephemeral=True)
+
+    if tag == heute_key():
+        await refresh_wache_nachricht(interaction.guild)
 
 @tree.command(name="meine_wache", description="Zeigt deinen heutigen Routenwache-Status")
 async def meine_wache(interaction: discord.Interaction):
