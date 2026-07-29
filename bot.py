@@ -24,6 +24,9 @@ MAX_PLAETZE_PRO_SLOT = 3
 # Ein-/Austragen in einen Zeitraum ist bewusst für ALLE offen.
 LEITUNG_ROLLE_ID = 1526202327483285629
 
+# Alle Mitglieder mit dieser Rolle erscheinen im Leaderboard – auch mit 0 Stunden.
+ROUTENWACHE_ROLLE_ID = 1526202327365582918
+
 
 def ist_admin_oder_leitung(interaction: discord.Interaction) -> bool:
     """True für echte Admins ODER Mitglieder mit der Leitungs-Rolle.
@@ -313,18 +316,42 @@ async def poste_tages_log(guild: discord.Guild, datum: str):
 def build_gesamtuebersicht_embed(guild: discord.Guild) -> discord.Embed:
     """Baut das Ranking 'wer hat insgesamt wie viele Stunden Routenwache
     gemacht' – wird sowohl vom /wache_gesamtuebersicht-Befehl als auch
-    für den Leaderboard-Channel verwendet."""
+    für den Leaderboard-Channel verwendet.
+
+    Zeigt ALLE Mitglieder mit der Routenwache-Rolle (ROUTENWACHE_ROLLE_ID),
+    auch wenn sie noch 0 Stunden haben – nicht nur die, die schon mal
+    eingetragen waren. Wer 0 Stunden hat oder im Vergleich zu den anderen
+    Rollenmitgliedern relativ wenig (unter der Hälfte des Durchschnitts),
+    wird markiert, damit auf einen Blick sichtbar ist, wer noch dran
+    (bald) sollte."""
     zaehler = gesamt_zeit_pro_user()
 
-    if not zaehler:
-        beschreibung = "*Es liegen noch keine abgeschlossenen Routenwache-Tage vor.*"
+    rolle = guild.get_role(ROUTENWACHE_ROLLE_ID) if guild else None
+    mitglieder = rolle.members if rolle else []
+
+    if not rolle:
+        beschreibung = "*Die Routenwache-Rolle wurde auf dem Server nicht gefunden.*"
+    elif not mitglieder:
+        beschreibung = "*Niemand hat aktuell die Routenwache-Rolle.*"
     else:
-        sortiert = sorted(zaehler.items(), key=lambda x: x[1], reverse=True)
+        eintraege = {str(m.id): zaehler.get(str(m.id), 0) for m in mitglieder}
+        durchschnitt = sum(eintraege.values()) / len(eintraege)
+        schwelle = durchschnitt / 2  # unter der Hälfte des Durchschnitts = "bald dran"
+
+        sortiert = sorted(eintraege.items(), key=lambda x: x[1], reverse=True)
         zeilen = []
         for i, (uid, stunden) in enumerate(sortiert, start=1):
-            member = guild.get_member(int(uid)) if guild else None
+            member = guild.get_member(int(uid))
             name = member.mention if member else f"Unbekanntes Mitglied ({uid})"
-            zeilen.append(f"**{i}.** {name} — **{stunden}h**")
+
+            if stunden == 0:
+                marker = " 🆘 *noch nie dabei*"
+            elif stunden < schwelle:
+                marker = " ⚠️ *bald dran*"
+            else:
+                marker = ""
+
+            zeilen.append(f"**{i}.** {name} — **{stunden}h**{marker}")
 
         # Discord-Embed-Description ist auf 4096 Zeichen begrenzt
         beschreibung = "\n".join(zeilen)
@@ -336,7 +363,7 @@ def build_gesamtuebersicht_embed(guild: discord.Guild) -> discord.Embed:
         description=beschreibung,
         color=EMBED_COLOR
     )
-    embed.set_footer(text="ECLIPSE – Routenwache • Summe aller abgeschlossenen Tage • wird täglich um 00:01 Uhr aktualisiert")
+    embed.set_footer(text="ECLIPSE – Routenwache • Summe aller abgeschlossenen Tage • 🆘 = 0h, ⚠️ = unter halbem Durchschnitt • täglich 00:01 Uhr aktualisiert")
     embed.timestamp = datetime.now(TIMEZONE)
     return embed
 
