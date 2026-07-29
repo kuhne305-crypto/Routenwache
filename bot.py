@@ -518,10 +518,10 @@ async def wache_gesamtuebersicht(interaction: discord.Interaction):
     embed = build_gesamtuebersicht_embed(interaction.guild)
     await interaction.response.send_message(embed=embed)
 
-@tree.command(name="wache_gesamtuebersicht_channel_setzen", description="Setzt den Channel für die live aktualisierte Gesamtübersicht")
+@tree.command(name="wache_gesamt_channel_setzen", description="Setzt den Channel für die live aktualisierte Gesamtübersicht")
 @app_commands.describe(channel="Der Channel, in dem die Gesamtübersicht laufend aktualisiert wird")
 @app_commands.check(ist_admin_oder_leitung)
-async def wache_gesamtuebersicht_channel_setzen(interaction: discord.Interaction, channel: discord.TextChannel):
+async def wache_gesamt_channel_setzen(interaction: discord.Interaction, channel: discord.TextChannel):
     data["channel_gesamtuebersicht"] = channel.id
     data["gesamtuebersicht_nachricht_id"] = None
     save_data(data)
@@ -542,7 +542,7 @@ async def channels_info(interaction: discord.Interaction):
     await interaction.response.send_message(
         f"**Aktuelle Einstellungen – Routenwache:**\n\n"
         f"Routenwache (Buttons):  {stempel_ch.mention if stempel_ch else '❌ Nicht gesetzt – /wache_channel_setzen benutzen'}\n"
-        f"Gesamtübersicht (live, laufend aktualisiert):  {gesamt_ch.mention if gesamt_ch else '❌ Nicht gesetzt – /wache_gesamtuebersicht_channel_setzen benutzen'}\n"
+        f"Gesamtübersicht (live, laufend aktualisiert):  {gesamt_ch.mention if gesamt_ch else '❌ Nicht gesetzt – /wache_gesamt_channel_setzen benutzen'}\n"
         f"Routenwache-Log (täglich 00:01 Uhr):  {stempel_liste_ch.mention if stempel_liste_ch else '❌ Nicht gesetzt – /wache_liste_channel_setzen benutzen'}",
         ephemeral=True
     )
