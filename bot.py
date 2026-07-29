@@ -20,13 +20,14 @@ DATA_FILE = os.path.join(DATA_DIR, "data.json")
 SLOTS = ["20-21", "21-22", "22-23", "23-24"]
 MAX_PLAETZE_PRO_SLOT = 3
 
-# Leitung: darf das Setup (Channel setzen, Nachricht posten) erledigen.
+# Leitung: darf das Setup (Channel setzen, Nachricht posten, Nachtragen) erledigen.
 # Ein-/Austragen in einen Zeitraum ist bewusst für ALLE offen.
 LEITUNG_ROLLE_ID = 1526202327483285629
 
+
 def ist_admin_oder_leitung(interaction: discord.Interaction) -> bool:
     """True für echte Admins ODER Mitglieder mit der Leitungs-Rolle.
-    Wird nur für die Setup-Befehle benutzt (Channel setzen / Nachricht posten)."""
+    Wird nur für die Setup-/Korrektur-Befehle benutzt."""
     if interaction.user.guild_permissions.administrator:
         return True
     return any(r.id == LEITUNG_ROLLE_ID for r in interaction.user.roles)
@@ -35,29 +36,35 @@ def ist_admin_oder_leitung(interaction: discord.Interaction) -> bool:
 # ════════════════════════════════════════════════════════════════════════════
 # 💾  DATENSPEICHER
 # ════════════════════════════════════════════════════════════════════════════
-def load_data():
+# Hinweis: Die Feldnamen bleiben bewusst so, wie sie schon in data.json auf
+# dem Server stehen (channel_stempel, channel_stempel_liste,
+# channel_gesamtuebersicht, ...) – damit beim Deploy nichts von der
+# bestehenden Konfiguration (bereits gesetzte Channels) verloren geht.
+
+STANDARD_DATEN = {
+    "channel_stempel": 1531376112226140260,          # Buttons-Channel (Eintragen)
+    "stempel_nachricht_id": None,
+    "channel_stempel_liste": 1531376274130341909,     # Log-Channel (täglicher Post um 00:01 Uhr)
+    "channel_gesamtuebersicht": None,                 # Leaderboard-Channel (/set_leaderboard)
+    "gesamtuebersicht_nachricht_id": None,
+    "tage": {},  # { "28.07.2026": { "20-21": ["userid", ...], "21-22": [...], ... } }
+}
+
+def load_data() -> dict:
     if os.path.exists(DATA_FILE):
         with open(DATA_FILE, "r") as f:
             geladen = json.load(f)
     else:
         geladen = {}
 
-    standard = {
-        "channel_stempel": 1531376112226140260,
-        "stempel_nachricht_id": None,
-        "channel_stempel_liste": 1531376274130341909,
-        "stempel_liste_nachricht_id": None,
-        "channel_gesamtuebersicht": None,
-        "gesamtuebersicht_nachricht_id": None,
-        "tage": {},  # { "28.07.2026": { "20-21": ["userid", ...], "21-22": [...], ... } }
-    }
     if not geladen:
-        return standard
-    for key, wert in standard.items():
+        return dict(STANDARD_DATEN)
+
+    for key, wert in STANDARD_DATEN.items():
         geladen.setdefault(key, wert)
     return geladen
 
-def save_data(data):
+def save_data(data: dict) -> None:
     with open(DATA_FILE, "w") as f:
         json.dump(data, f, indent=2)
 
@@ -76,14 +83,11 @@ tree = bot.tree
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# 🛣️  ROUTENWACHE (Zeitraum-Anmeldung für den heutigen Tag)
+# 🧰  HILFSFUNKTIONEN
 # ════════════════════════════════════════════════════════════════════════════
-# Komplett offen: es gibt hier absichtlich KEINE Rollen-/Berechtigungs-
-# einschränkung. Jedes Mitglied kann sich für einen oder mehrere Zeiträume
-# ein-/austragen und auch andere Mitglieder ein-/austragen.
 
 def heute_key() -> str:
-    """Aktuelles Datum als String, z.B. '28.07.2026'."""
+    """Aktuelles Datum als String, z.B. '29.07.2026'."""
     return datetime.now(TIMEZONE).strftime("%d.%m.%Y")
 
 def parse_datum(datum_str: str) -> str:
@@ -106,7 +110,8 @@ def get_tag_eintrag(datum: str) -> dict:
     return eintrag
 
 def alle_slots_von_user(eintrag: dict, uid: str) -> list:
-    """Gibt ALLE Slots zurück, in denen uid heute eingetragen ist (kann mehrere sein)."""
+    """Gibt ALLE Slots zurück, in denen uid an diesem Tag eingetragen ist
+    (kann mehrere sein, da Mehrfach-Eintragung erlaubt ist)."""
     return [slot for slot, liste in eintrag.items() if uid in liste]
 
 def gesamt_zeit_pro_user() -> dict:
@@ -115,15 +120,22 @@ def gesamt_zeit_pro_user() -> dict:
     Der heutige, noch laufende Tag zählt bewusst noch nicht mit, da er
     sich noch ändern kann (Ein-/Austragen läuft ja noch)."""
     zaehler = {}
-    tage = data.get("tage", {})
     heute = heute_key()
-    for datum, eintrag in tage.items():
+    for datum, eintrag in data.get("tage", {}).items():
         if datum == heute:
             continue
         for slot, liste in eintrag.items():
             for uid in liste:
                 zaehler[uid] = zaehler.get(uid, 0) + 1
     return zaehler
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# 🛣️  ROUTENWACHE-BUTTONS (Eintragen für den heutigen Tag)
+# ════════════════════════════════════════════════════════════════════════════
+# Komplett offen: es gibt hier absichtlich KEINE Rollen-/Berechtigungs-
+# einschränkung. Jedes Mitglied kann sich für einen oder mehrere Zeiträume
+# ein-/austragen.
 
 def build_wache_embed(datum: str, guild: discord.Guild) -> discord.Embed:
     embed = discord.Embed(title=f"🛣️ Routenwache Heute ({datum})", color=EMBED_COLOR)
@@ -147,8 +159,8 @@ def build_wache_embed(datum: str, guild: discord.Guild) -> discord.Embed:
 
 
 class WacheView(discord.ui.View):
-    """Persistente View mit einem Button pro Zeitraum. Wird dynamisch
-    neu aufgebaut, damit volle Zeiträume ausgegraut/deaktiviert sind.
+    """Persistente View mit einem Button pro Zeitraum. Wird dynamisch neu
+    aufgebaut, damit volle Zeiträume ausgegraut/deaktiviert sind.
 
     Jeder Zeitraum-Button ist unabhängig: man kann sich für beliebig viele
     Zeiträume gleichzeitig eintragen. Klickt man den Button eines Zeitraums
@@ -223,6 +235,8 @@ class WacheView(discord.ui.View):
 wache_view: "WacheView | None" = None
 
 async def refresh_wache_nachricht(guild: discord.Guild):
+    """Editiert (oder postet erstmalig) die EINE Buttons-Nachricht im
+    Routenwache-Channel. Läuft live – bei jedem Ein-/Austragen."""
     if not data.get("channel_stempel"):
         return
     kanal = guild.get_channel(int(data["channel_stempel"]))
@@ -246,12 +260,15 @@ async def refresh_wache_nachricht(guild: discord.Guild):
     data["stempel_nachricht_id"] = str(msg.id)
     save_data(data)
 
+
+# ════════════════════════════════════════════════════════════════════════════
+# 📋  TAGES-LOG (ein neuer Post pro abgeschlossenem Tag, um 00:01 Uhr)
+# ════════════════════════════════════════════════════════════════════════════
+
 def build_tages_log_embed(datum: str, guild: discord.Guild) -> discord.Embed:
     """Baut den Log-Embed für einen ABGESCHLOSSENEN Tag – wer war wann
-    (welcher Zeitraum) eingetragen. Wird einmal täglich um 00:01 Uhr
-    als NEUE Nachricht in den Log-Channel gepostet. Format wie die
-    Gesamtübersicht: eine kompakte nummerierte Liste, hier aber
-    'wer war wann eingetragen' statt Gesamtstunden."""
+    (welcher Zeitraum) eingetragen. Kompakte nummerierte Liste, analog zur
+    Gesamtübersicht, hier aber 'wer war wann eingetragen' statt Stunden."""
     eintrag = data.get("tage", {}).get(datum, {})
 
     zeilen = []
@@ -288,12 +305,78 @@ async def poste_tages_log(guild: discord.Guild, datum: str):
     await kanal.send(embed=embed)
 
 
-# ─── Slash-Commands ────────────────────────────────────────────────────────────
-# Hinweis: /wache_channel_setzen, /wache_liste_channel_setzen, /wache_posten und
-# /wache_nachtragen bleiben Admin/Leitungs-Befehle (Setup bzw. rückwirkende
-# Korrekturen). /wache_eintragen, /wache_austragen, /meine_wache und
-# /wache_gesamtuebersicht haben KEINE Berechtigungs-Einschränkung – jedes
-# Mitglied kann sie nutzen (auch für andere Mitglieder, jeweils nur für heute).
+# ════════════════════════════════════════════════════════════════════════════
+# 📊  GESAMTÜBERSICHT / LEADERBOARD (nur abgeschlossene Tage, 1x täglich)
+# ════════════════════════════════════════════════════════════════════════════
+
+def build_gesamtuebersicht_embed(guild: discord.Guild) -> discord.Embed:
+    """Baut das Ranking 'wer hat insgesamt wie viele Stunden Routenwache
+    gemacht' – wird sowohl vom /wache_gesamtuebersicht-Befehl als auch
+    für den Leaderboard-Channel verwendet."""
+    zaehler = gesamt_zeit_pro_user()
+
+    if not zaehler:
+        beschreibung = "*Es liegen noch keine abgeschlossenen Routenwache-Tage vor.*"
+    else:
+        sortiert = sorted(zaehler.items(), key=lambda x: x[1], reverse=True)
+        zeilen = []
+        for i, (uid, stunden) in enumerate(sortiert, start=1):
+            member = guild.get_member(int(uid)) if guild else None
+            name = member.mention if member else f"Unbekanntes Mitglied ({uid})"
+            zeilen.append(f"**{i}.** {name} — **{stunden}h**")
+
+        # Discord-Embed-Description ist auf 4096 Zeichen begrenzt
+        beschreibung = "\n".join(zeilen)
+        if len(beschreibung) > 4000:
+            beschreibung = beschreibung[:4000] + "\n*… (gekürzt)*"
+
+    embed = discord.Embed(
+        title="📊 Gesamtübersicht Routenwache",
+        description=beschreibung,
+        color=EMBED_COLOR
+    )
+    embed.set_footer(text="ECLIPSE – Routenwache • Summe aller abgeschlossenen Tage • wird täglich um 00:01 Uhr aktualisiert")
+    embed.timestamp = datetime.now(TIMEZONE)
+    return embed
+
+async def refresh_gesamtuebersicht(guild: discord.Guild):
+    """Editiert (oder postet erstmalig) die EINE Leaderboard-Nachricht im
+    dafür gesetzten Channel. Wird bewusst NUR bei der täglichen
+    00:01-Routine (und beim Bot-Start / Channel-Setup) aufgerufen – NICHT
+    bei jedem Ein-/Austragen, da die Stunden erst zählen, wenn ein Tag
+    abgeschlossen ist (siehe gesamt_zeit_pro_user)."""
+    if not data.get("channel_gesamtuebersicht"):
+        return
+    kanal = guild.get_channel(int(data["channel_gesamtuebersicht"]))
+    if not kanal:
+        return
+
+    embed = build_gesamtuebersicht_embed(guild)
+
+    msg_id = data.get("gesamtuebersicht_nachricht_id")
+    if msg_id:
+        try:
+            msg = await kanal.fetch_message(int(msg_id))
+            await msg.edit(embed=embed)
+            return
+        except Exception as e:
+            print(f"Alte Gesamtübersicht-Nachricht nicht gefunden, poste neu: {e}")
+
+    msg = await kanal.send(embed=embed)
+    data["gesamtuebersicht_nachricht_id"] = str(msg.id)
+    save_data(data)
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# 🎛️  SLASH-COMMANDS
+# ════════════════════════════════════════════════════════════════════════════
+# Admin/Leitung: /wache_channel_setzen, /wache_liste_channel_setzen,
+# /set_leaderboard, /wache_posten, /wache_nachtragen, /channels.
+# Für ALLE offen: /wache_eintragen, /wache_austragen, /meine_wache,
+# /wache_gesamtuebersicht.
+
+WACHE_CHOICES = [app_commands.Choice(name=slot_label(s), value=s) for s in SLOTS]
+
 
 @tree.command(name="wache_channel_setzen", description="Setzt den Channel für die Routenwache-Buttons")
 @app_commands.describe(channel="Der Channel wo die Zeitraum-Buttons gepostet werden")
@@ -304,6 +387,7 @@ async def wache_channel_setzen(interaction: discord.Interaction, channel: discor
     save_data(data)
     await interaction.response.send_message(f"✅ Routenwache-Channel gesetzt: {channel.mention}", ephemeral=True)
     await refresh_wache_nachricht(interaction.guild)
+
 
 @tree.command(name="wache_liste_channel_setzen", description="Setzt den Channel für das tägliche Routenwache-Log (Post um 00:01 Uhr)")
 @app_commands.describe(channel="Der Channel wo täglich um 00:01 Uhr der Log-Post landet")
@@ -317,6 +401,23 @@ async def wache_liste_channel_setzen(interaction: discord.Interaction, channel: 
         ephemeral=True
     )
 
+
+@tree.command(name="set_leaderboard", description="Setzt den Channel für die Gesamtübersicht (täglich um 00:01 Uhr aktualisiert)")
+@app_commands.describe(channel="Der Channel, in dem das Leaderboard täglich um 00:01 Uhr aktualisiert wird")
+@app_commands.check(ist_admin_oder_leitung)
+async def set_leaderboard(interaction: discord.Interaction, channel: discord.TextChannel):
+    data["channel_gesamtuebersicht"] = channel.id
+    data["gesamtuebersicht_nachricht_id"] = None
+    save_data(data)
+    await interaction.response.send_message(
+        f"✅ Leaderboard-Channel gesetzt: {channel.mention}\n"
+        f"Dort erscheint jetzt eine Nachricht mit dem Ranking, die täglich um 00:01 Uhr aktualisiert wird "
+        f"(zählt nur bereits abgeschlossene Tage, der heutige Tag läuft ja noch).",
+        ephemeral=True
+    )
+    await refresh_gesamtuebersicht(interaction.guild)
+
+
 @tree.command(name="wache_posten", description="Postet oder aktualisiert die Routenwache-Nachricht (Zeitraum-Buttons)")
 @app_commands.check(ist_admin_oder_leitung)
 async def wache_posten(interaction: discord.Interaction):
@@ -324,7 +425,6 @@ async def wache_posten(interaction: discord.Interaction):
     await refresh_wache_nachricht(interaction.guild)
     await interaction.followup.send("✅ Routenwache-Nachricht gepostet/aktualisiert.", ephemeral=True)
 
-WACHE_CHOICES = [app_commands.Choice(name=slot_label(s), value=s) for s in SLOTS]
 
 @tree.command(name="wache_eintragen", description="Trägt ein Mitglied manuell in einen heutigen Zeitraum ein")
 @app_commands.describe(mitglied="Das Mitglied", zeitraum="Der Zeitraum")
@@ -352,6 +452,7 @@ async def wache_eintragen(interaction: discord.Interaction, mitglied: discord.Me
 
     await interaction.response.send_message(f"✅ {mitglied.mention} wurde für **{slot_label(slot)}** eingetragen.", ephemeral=True)
     await refresh_wache_nachricht(interaction.guild)
+
 
 @tree.command(name="wache_nachtragen", description="Trägt ein Mitglied nachträglich für einen VERGANGENEN Tag/Zeitraum ein")
 @app_commands.describe(
@@ -394,13 +495,12 @@ async def wache_nachtragen(interaction: discord.Interaction, mitglied: discord.M
         f"✅ {mitglied.mention} wurde nachträglich für **{tag} — {slot_label(slot)}** eingetragen.", ephemeral=True
     )
 
-    # Wenn es sich um den heutigen Tag handelt, auch die Live-Buttons-Nachricht aktualisieren
+    # Wenn es sich um den heutigen Tag handelt, auch die Live-Buttons-Nachricht aktualisieren.
+    # Die Gesamtübersicht wird bewusst NICHT sofort aktualisiert – sie zählt
+    # erst wieder bei der täglichen 00:01-Routine (nur abgeschlossene Tage).
     if tag == heute_key():
         await refresh_wache_nachricht(interaction.guild)
-    # Hinweis: Die Gesamtübersicht wird bewusst NICHT sofort aktualisiert –
-    # sie zählt erst bei der täglichen 00:01-Routine wieder neu (nur
-    # abgeschlossene Tage). Ein nachgetragener Eintrag für einen alten
-    # Tag erscheint dort also spätestens beim nächsten Tageswechsel.
+
 
 @tree.command(name="wache_austragen", description="Trägt dich (oder ein anderes Mitglied) aus einem oder allen Zeiträumen aus – heute oder an einem vergangenen Tag")
 @app_commands.describe(
@@ -446,63 +546,6 @@ async def wache_austragen(interaction: discord.Interaction, mitglied: discord.Me
     if tag == heute_key():
         await refresh_wache_nachricht(interaction.guild)
 
-def build_gesamtuebersicht_embed(guild: discord.Guild) -> discord.Embed:
-    """Baut das Ranking 'wer hat insgesamt wie viele Stunden Routenwache
-    gemacht' – wird sowohl vom /wache_gesamtuebersicht-Befehl als auch
-    für den live aktualisierten Gesamtübersicht-Channel verwendet."""
-    zaehler = gesamt_zeit_pro_user()
-
-    if not zaehler:
-        beschreibung = "*Es liegen noch keine Routenwache-Daten vor.*"
-    else:
-        sortiert = sorted(zaehler.items(), key=lambda x: x[1], reverse=True)
-        zeilen = []
-        for i, (uid, stunden) in enumerate(sortiert, start=1):
-            member = guild.get_member(int(uid)) if guild else None
-            name = member.mention if member else f"Unbekanntes Mitglied ({uid})"
-            zeilen.append(f"**{i}.** {name} — **{stunden}h**")
-
-        # Discord-Embed-Description ist auf 4096 Zeichen begrenzt
-        beschreibung = "\n".join(zeilen)
-        if len(beschreibung) > 4000:
-            beschreibung = beschreibung[:4000] + "\n*… (gekürzt)*"
-
-    embed = discord.Embed(
-        title="📊 Gesamtübersicht Routenwache",
-        description=beschreibung,
-        color=EMBED_COLOR
-    )
-    embed.set_footer(text="ECLIPSE – Routenwache • Summe aller abgeschlossenen Tage • wird täglich um 00:01 Uhr aktualisiert")
-    embed.timestamp = datetime.now(TIMEZONE)
-    return embed
-
-async def refresh_gesamtuebersicht(guild: discord.Guild):
-    """Editiert (oder postet erstmalig) die EINE Gesamtübersicht-Nachricht
-    im dafür gesetzten Channel. Wird bewusst NUR bei der täglichen
-    00:01-Routine (und beim Bot-Start / Channel-Setup) aufgerufen – NICHT
-    bei jedem Ein-/Austragen. Die Gesamtstunden zählen erst, wenn ein Tag
-    abgeschlossen ist (siehe gesamt_zeit_pro_user)."""
-    if not data.get("channel_gesamtuebersicht"):
-        return
-    kanal = guild.get_channel(int(data["channel_gesamtuebersicht"]))
-    if not kanal:
-        return
-
-    embed = build_gesamtuebersicht_embed(guild)
-
-    msg_id = data.get("gesamtuebersicht_nachricht_id")
-    if msg_id:
-        try:
-            msg = await kanal.fetch_message(int(msg_id))
-            await msg.edit(embed=embed)
-            return
-        except Exception as e:
-            print(f"Alte Gesamtübersicht-Nachricht nicht gefunden, poste neu: {e}")
-
-    msg = await kanal.send(embed=embed)
-    data["gesamtuebersicht_nachricht_id"] = str(msg.id)
-    save_data(data)
-
 
 @tree.command(name="meine_wache", description="Zeigt deinen heutigen Routenwache-Status")
 async def meine_wache(interaction: discord.Interaction):
@@ -518,25 +561,12 @@ async def meine_wache(interaction: discord.Interaction):
 
     await interaction.response.send_message(f"**Deine Routenwache ({today})**\n{text}", ephemeral=True)
 
+
 @tree.command(name="wache_gesamtuebersicht", description="Zeigt, wer insgesamt wie viele Stunden Routenwache gemacht hat")
 async def wache_gesamtuebersicht(interaction: discord.Interaction):
     embed = build_gesamtuebersicht_embed(interaction.guild)
     await interaction.response.send_message(embed=embed)
 
-@tree.command(name="set_leaderboard", description="Setzt den Channel für die Gesamtübersicht (täglich um 00:01 Uhr aktualisiert)")
-@app_commands.describe(channel="Der Channel, in dem die Gesamtübersicht täglich um 00:01 Uhr aktualisiert wird")
-@app_commands.check(ist_admin_oder_leitung)
-async def set_leaderboard(interaction: discord.Interaction, channel: discord.TextChannel):
-    data["channel_gesamtuebersicht"] = channel.id
-    data["gesamtuebersicht_nachricht_id"] = None
-    save_data(data)
-    await interaction.response.send_message(
-        f"✅ Gesamtübersicht-Channel gesetzt: {channel.mention}\n"
-        f"Dort erscheint jetzt eine Nachricht mit dem Leaderboard, die täglich um 00:01 Uhr aktualisiert wird "
-        f"(zählt nur bereits abgeschlossene Tage, der heutige Tag läuft ja noch).",
-        ephemeral=True
-    )
-    await refresh_gesamtuebersicht(interaction.guild)
 
 @tree.command(name="channels", description="Zeigt die aktuell gesetzten Channels für die Routenwache")
 @app_commands.check(ist_admin_oder_leitung)
@@ -548,14 +578,14 @@ async def channels_info(interaction: discord.Interaction):
     await interaction.response.send_message(
         f"**Aktuelle Einstellungen – Routenwache:**\n\n"
         f"Routenwache (Buttons):  {stempel_ch.mention if stempel_ch else '❌ Nicht gesetzt – /wache_channel_setzen benutzen'}\n"
-        f"Gesamtübersicht (täglich 00:01 Uhr, nur abgeschlossene Tage):  {gesamt_ch.mention if gesamt_ch else '❌ Nicht gesetzt – /set_leaderboard benutzen'}\n"
+        f"Leaderboard (täglich 00:01 Uhr, nur abgeschlossene Tage):  {gesamt_ch.mention if gesamt_ch else '❌ Nicht gesetzt – /set_leaderboard benutzen'}\n"
         f"Routenwache-Log (täglich 00:01 Uhr):  {stempel_liste_ch.mention if stempel_liste_ch else '❌ Nicht gesetzt – /wache_liste_channel_setzen benutzen'}",
         ephemeral=True
     )
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# 🌙  TAGESWECHSEL (automatischer Reset täglich um 00:01 Uhr)
+# 🌙  TAGESWECHSEL (automatisch täglich um 00:01 Uhr)
 # ════════════════════════════════════════════════════════════════════════════
 letzter_bekannter_tag = None
 
@@ -563,10 +593,11 @@ letzter_bekannter_tag = None
 async def tageswechsel_check():
     """Läuft jeden Tag exakt um 00:01 Uhr (Europe/Berlin):
     1. Postet den Log-Eintrag für den GESTRIGEN Tag in den Log-Channel
-       (wer war wann/wie lange eingetragen) – als neue Nachricht, damit
-       im Channel eine durchsuchbare Historie entsteht.
+       (wer war wann eingetragen) – als neue Nachricht, damit im Channel
+       eine durchsuchbare Historie entsteht.
     2. Setzt die Routenwache-Buttons-Nachricht für den neuen Tag auf.
-    3. Aktualisiert die live Gesamtübersicht."""
+    3. Aktualisiert die Leaderboard-Nachricht (zählt jetzt den gestrigen
+       Tag als abgeschlossen mit)."""
     global letzter_bekannter_tag
     vorheriger_tag = letzter_bekannter_tag
     heute = heute_key()
@@ -591,6 +622,39 @@ async def before_tageswechsel_check():
 # 🎯  BOT EVENTS
 # ════════════════════════════════════════════════════════════════════════════
 
+async def sync_commands():
+    """Synct die Slash-Commands. Wichtig für saubere/aktuelle Befehle:
+
+    1. GLOBALE Befehle werden zuerst komplett gelöscht (leer gesynct).
+       Grund: frühere Versionen dieses Bots haben sowohl Guild- als auch
+       global gesynct. Globale Änderungen brauchen aber bis zu 1 Stunde,
+       um bei Discord zu propagieren – dadurch blieben umbenannte/alte
+       Befehle im Client sichtbar ("veraltete Befehle"). Indem wir NUR
+       noch guild-spezifisch synden, sind Änderungen sofort sichtbar,
+       und die alten globalen Karteileichen werden hier einmalig entfernt.
+    2. Danach werden die aktuellen Befehle NUR auf die eine Guild (GUILD_ID)
+       gesynct – das ist sofort wirksam, kein Warten nötig.
+    """
+    try:
+        tree.clear_commands(guild=None)
+        await tree.sync()
+        print("🧹 Alte globale Befehle bereinigt.")
+    except Exception as e:
+        print(f"⚠️ Konnte globale Befehle nicht bereinigen: {e}")
+
+    try:
+        if GUILD_ID:
+            guild_obj = discord.Object(id=int(GUILD_ID))
+            tree.copy_global_to(guild=guild_obj)
+            synced = await tree.sync(guild=guild_obj)
+            print(f"✅ {len(synced)} Commands sofort auf Guild {GUILD_ID} gesynct: {[c.name for c in synced]}")
+        else:
+            synced = await tree.sync()
+            print(f"⚠️ Keine GUILD_ID gesetzt — {len(synced)} Commands global gesynct (kann bis zu 1h dauern).")
+    except Exception as e:
+        print(f"❌ FEHLER beim Sync: {e}")
+
+
 @bot.event
 async def on_ready():
     global letzter_bekannter_tag, wache_view
@@ -598,29 +662,17 @@ async def on_ready():
 
     if wache_view is None:
         wache_view = WacheView()
-
-    try:
-        if GUILD_ID:
-            guild_obj = discord.Object(id=int(GUILD_ID))
-            tree.copy_global_to(guild=guild_obj)
-            synced = await tree.sync(guild=guild_obj)
-            print(f"✅ {len(synced)} Commands SOFORT auf Guild {GUILD_ID} gesynct: {[c.name for c in synced]}")
-        else:
-            print("⚠️ Keine GUILD_ID gesetzt — sync läuft global (kann bis zu 1h dauern).")
-
-        synced_global = await tree.sync()
-        print(f"✅ {len(synced_global)} Commands global gesynct: {[c.name for c in synced_global]}")
-    except Exception as e:
-        print(f"❌ FEHLER beim Sync: {e}")
-
     bot.add_view(wache_view)
+
+    await sync_commands()
+
     letzter_bekannter_tag = heute_key()
 
     for guild in bot.guilds:
         try:
             await refresh_wache_nachricht(guild)
             await refresh_gesamtuebersicht(guild)
-            print("✅ Routenwache-Nachricht & Gesamtübersicht aufgesetzt.")
+            print("✅ Routenwache-Nachricht & Leaderboard aufgesetzt.")
         except Exception as e:
             print(f"❌ Fehler beim Auto-Posten der Nachricht: {e}")
 
@@ -628,6 +680,7 @@ async def on_ready():
         tageswechsel_check.start()
 
     print("Bot ist bereit!")
+
 
 @bot.event
 async def on_member_remove(member: discord.Member):
@@ -653,6 +706,7 @@ async def on_member_remove(member: discord.Member):
         await refresh_wache_nachricht(member.guild)
     except Exception as e:
         print(f"❌ Fehler beim Aktualisieren nach Austritt: {e}")
+
 
 @bot.event
 async def on_app_command_error(interaction: discord.Interaction, error):
