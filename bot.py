@@ -265,6 +265,32 @@ async def refresh_wache_nachricht(guild: discord.Guild):
     save_data(data)
 
 
+async def geist_ping_neues_datum(guild: discord.Guild):
+    """Pingt die Routenwache-Rolle EINMAL im Buttons-Channel und löscht die
+    Ping-Nachricht sofort wieder (klassischer 'Geist-Ping'): Die Mitglieder
+    bekommen die Erwähnungs-Benachrichtigung, aber im Channel bleibt nichts
+    stehen. Wird bewusst NUR aufgerufen, wenn sich das Datum in der
+    Routenwache-Nachricht wirklich ändert (Tageswechsel um 00:01 Uhr) –
+    NICHT bei jedem normalen Ein-/Austragen-Update."""
+    if not data.get("channel_stempel"):
+        return
+    kanal = guild.get_channel(int(data["channel_stempel"]))
+    if not kanal:
+        return
+
+    rolle = guild.get_role(ROUTENWACHE_ROLLE_ID)
+    mention_text = rolle.mention if rolle else f"<@&{ROUTENWACHE_ROLLE_ID}>"
+
+    try:
+        ping_msg = await kanal.send(
+            mention_text,
+            allowed_mentions=discord.AllowedMentions(roles=True, everyone=False, users=False)
+        )
+        await ping_msg.delete()
+    except Exception as e:
+        print(f"❌ Fehler beim Geist-Ping: {e}")
+
+
 # ════════════════════════════════════════════════════════════════════════════
 # 📋  TAGES-LOG (ein neuer Post pro abgeschlossenem Tag, um 00:01 Uhr)
 # ════════════════════════════════════════════════════════════════════════════
@@ -628,7 +654,9 @@ async def tageswechsel_check():
        eine durchsuchbare Historie entsteht.
     2. Setzt die Routenwache-Buttons-Nachricht für den neuen Tag auf.
     3. Aktualisiert die Leaderboard-Nachricht (zählt jetzt den gestrigen
-       Tag als abgeschlossen mit)."""
+       Tag als abgeschlossen mit).
+    4. Geist-pingt die Routenwache-Rolle EINMAL im Buttons-Channel – NUR
+       hier, weil sich hier wirklich das DATUM in der Nachricht ändert."""
     global letzter_bekannter_tag
     vorheriger_tag = letzter_bekannter_tag
     heute = heute_key()
@@ -640,6 +668,8 @@ async def tageswechsel_check():
                 await poste_tages_log(guild, vorheriger_tag)
             await refresh_wache_nachricht(guild)
             await refresh_gesamtuebersicht(guild)
+            if vorheriger_tag and vorheriger_tag != heute:
+                await geist_ping_neues_datum(guild)
             print(f"🌙 00:01 Tageswechsel: Log für {vorheriger_tag} gepostet, Routenwache für {heute} neu aufgesetzt.")
         except Exception as e:
             print(f"❌ Fehler beim Tageswechsel: {e}")
