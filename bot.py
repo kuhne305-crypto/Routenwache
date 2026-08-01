@@ -20,6 +20,9 @@ DATA_FILE = os.path.join(DATA_DIR, "data.json")
 SLOTS = ["20-21", "21-22", "22-23", "23-24"]
 MAX_PLAETZE_PRO_SLOT = 3
 
+# Maximal so viele Zeiträume darf sich EIN Mitglied gleichzeitig an einem Tag eintragen.
+MAX_ZEITRAEUME_PRO_USER = 2
+
 # Leitung: darf das Setup (Channel setzen, Nachricht posten, Nachtragen) erledigen.
 # Ein-/Austragen in einen Zeitraum ist bewusst für ALLE offen.
 LEITUNG_ROLLE_ID = 1526202327483285629
@@ -115,7 +118,8 @@ def get_tag_eintrag(datum: str) -> dict:
 
 def alle_slots_von_user(eintrag: dict, uid: str) -> list:
     """Gibt ALLE Slots zurück, in denen uid an diesem Tag eingetragen ist
-    (kann mehrere sein, da Mehrfach-Eintragung erlaubt ist)."""
+    (kann mehrere sein, da Mehrfach-Eintragung erlaubt ist, aktuell max.
+    MAX_ZEITRAEUME_PRO_USER gleichzeitig über die Buttons)."""
     return [slot for slot, liste in eintrag.items() if uid in liste]
 
 def gesamt_zeit_pro_user() -> dict:
@@ -138,8 +142,20 @@ def gesamt_zeit_pro_user() -> dict:
 # 🛣️  ROUTENWACHE-BUTTONS (Eintragen für den heutigen Tag)
 # ════════════════════════════════════════════════════════════════════════════
 # Komplett offen: es gibt hier absichtlich KEINE Rollen-/Berechtigungs-
-# einschränkung. Jedes Mitglied kann sich für einen oder mehrere Zeiträume
-# ein-/austragen.
+# einschränkung. Jedes Mitglied kann sich für bis zu MAX_ZEITRAEUME_PRO_USER
+# Zeiträume gleichzeitig ein-/austragen.
+#
+# WICHTIG (Discord-Limitierung): Die Buttons-Nachricht ist EINE einzige
+# Nachricht, die ALLE Mitglieder gleich sehen. Discord erlaubt es nicht,
+# einem einzelnen Nutzer einen anderen Button-Zustand (z.B. "ausgegraut")
+# anzuzeigen als allen anderen. Ein "voller" oder "für dich nicht mehr
+# verfügbarer" Zeitraum kann daher NICHT visuell nur für bestimmte Personen
+# deaktiviert werden. Stattdessen bleiben die Buttons für alle klickbar,
+# und die Regeln (voll / max. Zeiträume erreicht) werden beim Klick geprüft:
+# wer nicht berechtigt ist, bekommt eine kurze private (ephemere) Fehler-
+# meldung statt der Eintragung. Wer selbst schon in einem Zeitraum steht,
+# kann sich dort IMMER wieder austragen – auch wenn der Zeitraum inzwischen
+# voll ist.
 
 def build_wache_embed(datum: str, guild: discord.Guild) -> discord.Embed:
     embed = discord.Embed(title=f"🛣️ Routenwache Heute ({datum})", color=EMBED_COLOR)
@@ -157,19 +173,16 @@ def build_wache_embed(datum: str, guild: discord.Guild) -> discord.Embed:
         bloecke.append(f"**{slot_label(slot)}**{voll_hinweis}\n{text}")
 
     embed.description = "\n\n".join(bloecke)
-    embed.set_footer(text="ECLIPSE – Routenwache • Klicke einen oder mehrere Zeiträume an, um dich ein- oder wieder auszutragen (max. 3 Plätze pro Stunde)")
+    embed.set_footer(text=f"ECLIPSE – Routenwache • Klicke einen Zeitraum an, um dich ein- oder wieder auszutragen (max. 3 Plätze pro Stunde, max. {MAX_ZEITRAEUME_PRO_USER} Zeiträume gleichzeitig pro Person)")
     embed.timestamp = datetime.now(TIMEZONE)
     return embed
 
 
 class WacheView(discord.ui.View):
-    """Persistente View mit einem Button pro Zeitraum. Wird dynamisch neu
-    aufgebaut, damit volle Zeiträume ausgegraut/deaktiviert sind.
-
-    Jeder Zeitraum-Button ist unabhängig: man kann sich für beliebig viele
-    Zeiträume gleichzeitig eintragen. Klickt man den Button eines Zeitraums
-    an, in dem man selbst schon eingetragen ist, wird man dort wieder
-    ausgetragen (Toggle) – die anderen Eintragungen bleiben unberührt."""
+    """Persistente View mit einem Button pro Zeitraum. Ein voller Zeitraum
+    wird ROT eingefärbt (statt grün), bleibt aber klickbar – Details siehe
+    Kommentar oben zur Discord-Limitierung. Ob ein Klick tatsächlich etwas
+    bewirkt, entscheidet handle_click() anhand der aktuellen Regeln."""
 
     def __init__(self):
         super().__init__(timeout=None)
@@ -184,8 +197,8 @@ class WacheView(discord.ui.View):
             voll = len(leute) >= MAX_PLAETZE_PRO_SLOT
             button = discord.ui.Button(
                 label=f"{slot_label(slot)} ({len(leute)}/{MAX_PLAETZE_PRO_SLOT})",
-                style=discord.ButtonStyle.success if not voll else discord.ButtonStyle.secondary,
-                disabled=voll,
+                style=discord.ButtonStyle.success if not voll else discord.ButtonStyle.danger,
+                disabled=False,
                 custom_id=f"wache_slot_{slot}",
             )
             button.callback = self._make_callback(slot)
@@ -202,7 +215,8 @@ class WacheView(discord.ui.View):
         uid = str(interaction.user.id)
         liste = eintrag.setdefault(slot, [])
 
-        # Bereits in DIESEM Zeitraum eingetragen -> wieder austragen
+        # Bereits in DIESEM Zeitraum eingetragen -> IMMER wieder austragen
+        # erlaubt, auch wenn der Zeitraum inzwischen voll geworden ist.
         if uid in liste:
             liste.remove(uid)
             save_data(data)
@@ -215,16 +229,24 @@ class WacheView(discord.ui.View):
             )
             return
 
+        # Zeitraum ist voll und der Klickende ist NICHT drin -> ablehnen
         if len(liste) >= MAX_PLAETZE_PRO_SLOT:
             await interaction.response.send_message(
-                "❌ Dieser Zeitraum ist leider gerade eben voll geworden. Bitte wähle einen anderen.",
+                f"❌ **{slot_label(slot)}** ist bereits voll ({MAX_PLAETZE_PRO_SLOT}/{MAX_PLAETZE_PRO_SLOT}). "
+                f"Nur Mitglieder, die dort schon eingetragen sind, können sich hier wieder austragen.",
                 ephemeral=True
             )
-            self.build_buttons()
-            try:
-                await interaction.message.edit(embed=build_wache_embed(today, interaction.guild), view=self)
-            except Exception:
-                pass
+            return
+
+        # Maximale Anzahl gleichzeitiger Zeiträume für diesen User erreicht
+        aktuelle_slots = alle_slots_von_user(eintrag, uid)
+        if len(aktuelle_slots) >= MAX_ZEITRAEUME_PRO_USER:
+            vorhandene = ", ".join(f"**{slot_label(s)}**" for s in aktuelle_slots)
+            await interaction.response.send_message(
+                f"❌ Du bist bereits in {MAX_ZEITRAEUME_PRO_USER} Zeiträumen eingetragen ({vorhandene}). "
+                f"Trage dich zuerst aus einem davon aus, um dich für einen weiteren Zeitraum einzutragen.",
+                ephemeral=True
+            )
             return
 
         liste.append(uid)
