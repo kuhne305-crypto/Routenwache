@@ -10,7 +10,10 @@ import os
 # ⚙️  KONFIGURATION
 # ════════════════════════════════════════════════════════════════════════════
 TOKEN    = os.environ.get("DISCORD_TOKEN")
-GUILD_ID = os.environ.get("GUILD_ID")
+# Fallback auf deine Server-ID, falls die Railway-Variable GUILD_ID mal
+# fehlt oder leer ist – die Variable hat aber weiterhin Vorrang, wenn sie
+# gesetzt ist.
+GUILD_ID = os.environ.get("GUILD_ID") or "1526202327365582910"
 TIMEZONE = pytz.timezone("Europe/Berlin")
 EMBED_COLOR = 0xFFD700  # Gelb
 DATA_DIR  = "/data" if os.path.isdir("/data") else "."
