@@ -292,7 +292,7 @@ async def geist_ping_neues_datum(guild: discord.Guild):
     Ping-Nachricht sofort wieder (klassischer 'Geist-Ping'): Die Mitglieder
     bekommen die Erwähnungs-Benachrichtigung, aber im Channel bleibt nichts
     stehen. Wird bewusst NUR aufgerufen, wenn sich das Datum in der
-    Routenwache-Nachricht wirklich ändert (Tageswechsel um 01:08 Uhr) –
+    Routenwache-Nachricht wirklich ändert (Tageswechsel um 00:01 Uhr) –
     NICHT bei jedem normalen Ein-/Austragen-Update."""
     if not data.get("channel_stempel"):
         return
@@ -608,9 +608,6 @@ async def wache_austragen(interaction: discord.Interaction, mitglied: discord.Me
         zu_entfernen = alle_slots_von_user(eintrag, uid)
 
     if not zu_entfernen:
-        # BUGFIX: Hier fehlte zuvor die Verneinung ("nicht") – die Meldung
-        # behauptete fälschlicherweise, die Person SEI eingetragen, obwohl
-        # dieser Zweig genau dann läuft, wenn sie es NICHT ist.
         bezug = f"für **{slot_label(zeitraum.value)}**" if zeitraum else "für keinen Zeitraum"
         await interaction.response.send_message(f"❌ {ziel.mention} ist am **{tag}** nicht {bezug} eingetragen.", ephemeral=True)
         return
@@ -663,6 +660,21 @@ async def channels_info(interaction: discord.Interaction):
     )
 
 
+@tree.command(name="sync_status", description="Zeigt, ob GUILD_ID gesetzt ist und wie die Befehle gesynct wurden")
+@app_commands.check(ist_admin_oder_leitung)
+async def sync_status(interaction: discord.Interaction):
+    guild_id_status = f"✅ Gesetzt: `{GUILD_ID}`" if GUILD_ID else "❌ NICHT gesetzt (Railway-Variable fehlt!)"
+    passt = ""
+    if GUILD_ID and interaction.guild:
+        passt = " ✅ (passt zu diesem Server)" if str(interaction.guild.id) == str(GUILD_ID) else " ⚠️ (passt NICHT zu diesem Server!)"
+    await interaction.response.send_message(
+        f"**GUILD_ID:** {guild_id_status}{passt}\n"
+        f"**Diese Server-ID:** `{interaction.guild.id if interaction.guild else '-'}`\n"
+        f"**Globale Bereinigung schon gelaufen:** {'✅ Ja' if data.get('globale_befehle_bereinigt') else '❌ Nein'}",
+        ephemeral=True
+    )
+
+
 # ════════════════════════════════════════════════════════════════════════════
 # 🌙  TAGESWECHSEL (automatisch täglich um 00:01 Uhr)
 # ════════════════════════════════════════════════════════════════════════════
@@ -708,30 +720,38 @@ async def before_tageswechsel_check():
 async def sync_commands():
     """Synct die Slash-Commands.
 
-    KRITISCHER BUGFIX: Vorher wurde ZUERST `tree.clear_commands(guild=None)`
-    aufgerufen. Das leert aber nicht nur die Commands auf Discords Seite,
-    sondern auch die lokale Command-Liste im `tree`-Objekt selbst. Der
-    darauffolgende Aufruf `tree.copy_global_to(guild=...)` kopiert die
-    Commands aus genau dieser (jetzt leeren!) lokalen Liste in die Guild –
-    das Ergebnis war, dass in der Guild am Ende GAR KEINE Commands mehr
-    ankamen. Das erklärt "Bot ist online, aber kein Command eingebbar".
+    BUGFIX (wichtig!): Die einmalige Bereinigung alter globaler Befehle
+    (`tree.clear_commands(guild=None)` + leerer Sync) darf NUR laufen,
+    wenn wir wirklich auf Guild-Sync umsteigen (also GUILD_ID gesetzt ist).
+    Vorher lief die Bereinigung IMMER, auch wenn GUILD_ID fehlte – dann
+    wurden die paar Zeilen zuvor frisch global registrierten Befehle im
+    selben Atemzug wieder gelöscht. Ergebnis: der Bot lief, aber es gab
+    dauerhaft keine sichtbaren Slash-Commands, ganz unabhängig von der
+    üblichen 'bis zu 1h'-Wartezeit für globale Syncs.
 
-    Jetzt läuft zuerst der Guild-Sync (solange die lokale Command-Liste
-    noch vollständig ist), und erst DANACH – und nur einmalig, dauerhaft
-    in data.json vermerkt – die Bereinigung der alten globalen Reste."""
-    try:
-        if GUILD_ID:
-            guild_obj = discord.Object(id=int(GUILD_ID))
-            tree.copy_global_to(guild=guild_obj)
-            synced = await tree.sync(guild=guild_obj)
-            print(f"✅ {len(synced)} Commands sofort auf Guild {GUILD_ID} gesynct: {[c.name for c in synced]}")
-        else:
+    Ohne GUILD_ID wird jetzt NUR global gesynct (keine Bereinigung), damit
+    wenigstens dieser Fallback zuverlässig funktioniert – auch wenn er bis
+    zu 1h braucht. Sobald GUILD_ID gesetzt ist, läuft zuerst der sofortige
+    Guild-Sync und danach, einmalig, die Bereinigung alter globaler Reste."""
+    if not GUILD_ID:
+        try:
             synced = await tree.sync()
             print(f"⚠️ Keine GUILD_ID gesetzt — {len(synced)} Commands global gesynct (kann bis zu 1h dauern).")
+        except Exception as e:
+            print(f"❌ FEHLER beim globalen Sync: {e}")
+        return
+
+    try:
+        guild_obj = discord.Object(id=int(GUILD_ID))
+        tree.copy_global_to(guild=guild_obj)
+        synced = await tree.sync(guild=guild_obj)
+        print(f"✅ {len(synced)} Commands sofort auf Guild {GUILD_ID} gesynct: {[c.name for c in synced]}")
     except discord.HTTPException as e:
         print(f"❌ FEHLER beim Guild-Sync (evtl. Discord-Rate-Limit): {e}")
+        return
     except Exception as e:
         print(f"❌ FEHLER beim Guild-Sync: {e}")
+        return
 
     if not data.get("globale_befehle_bereinigt"):
         try:
@@ -776,13 +796,8 @@ async def on_member_remove(member: discord.Member):
     """Entfernt automatisch die HEUTIGEN Routenwache-Einträge eines
     Mitglieds, sobald es den Server verlässt (Leave oder Kick).
 
-    BUGFIX: Vorher wurden die Einträge über ALLE Tage entfernt – auch
-    bereits abgeschlossene, die schon in die Gesamtübersicht (Leaderboard)
-    eingeflossen waren. Verließ jemand den Server, verschwanden damit
-    rückwirkend seine bereits "verdienten" Stunden aus der Statistik.
-    Jetzt wird nur noch der laufende, heutige Tag bereinigt (macht Sinn,
-    weil man ja nicht mehr da ist, um die Schicht anzutreten) –
-    abgeschlossene Tage bleiben unangetastet."""
+    Bereits abgeschlossene Tage bleiben unangetastet, damit rückwirkend
+    erspielte Stunden nicht aus dem Leaderboard verschwinden."""
     uid = str(member.id)
     eintrag = data.get("tage", {}).get(heute_key(), {})
     geaendert = False
