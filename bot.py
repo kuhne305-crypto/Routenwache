@@ -292,7 +292,7 @@ async def geist_ping_neues_datum(guild: discord.Guild):
     Ping-Nachricht sofort wieder (klassischer 'Geist-Ping'): Die Mitglieder
     bekommen die Erwähnungs-Benachrichtigung, aber im Channel bleibt nichts
     stehen. Wird bewusst NUR aufgerufen, wenn sich das Datum in der
-    Routenwache-Nachricht wirklich ändert (Tageswechsel um 00:01 Uhr) –
+    Routenwache-Nachricht wirklich ändert (Tageswechsel um 01:08 Uhr) –
     NICHT bei jedem normalen Ein-/Austragen-Update."""
     if not data.get("channel_stempel"):
         return
