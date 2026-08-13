@@ -30,6 +30,10 @@ STANDARD_SLOTS = ["18:00-19:30", "19:30-21:00", "21:00-22:30", "22:30-00:00"]
 # Ein-/Austragen in einen Zeitraum ist bewusst für ALLE offen.
 LEITUNG_ROLLE_ID = 1526202327483285629
 
+# Roster-Rolle für die Gesamtübersicht: ALLE Mitglieder mit dieser Rolle
+# werden dort gelistet, auch mit 0h (dann mit ⚠️ markiert statt zu fehlen).
+ROSTER_ROLLE_ID = 1526202327365582918
+
 
 def ist_admin_oder_leitung(interaction: discord.Interaction) -> bool:
     if interaction.user.guild_permissions.administrator:
@@ -46,6 +50,7 @@ def ist_admin_oder_leitung(interaction: discord.Interaction) -> bool:
 #         "name": "Morteco Heroin Route",
 #         "kapazitaet": 2,
 #         "slots": ["18:00-19:30", "19:30-21:00"],   # frei konfigurierbar, beliebig viele
+#         "slot_wochentage": {"18:00-19:30": [0,2,4]},  # optional pro Slot; fehlt = jeden Tag
 #         "channel_buttons": 123, "stempel_nachricht_id": "456",
 #         "channel_log": 123,
 #         "channel_leaderboard": 123, "leaderboard_nachricht_id": "456",
@@ -170,6 +175,19 @@ def ist_wochentag_aktiv(route_id: str, datum_str: str) -> bool:
     tag_datum = datetime.strptime(datum_str, "%d.%m.%Y").date()
     return tag_datum.weekday() in aktive
 
+def slot_wochentage_get(route_id: str, slot: str) -> list:
+    """Liefert die konfigurierten Wochentage EINES Zeitraums. Leere Liste = jeden Tag."""
+    return data.get("routen", {}).get(route_id, {}).get("slot_wochentage", {}).get(slot, [])
+
+def ist_slot_an_tag_aktiv(route_id: str, slot: str, datum_str: str) -> bool:
+    """Prüft, ob ein bestimmter Zeitraum an diesem Datum überhaupt existiert
+    (Wochentags-Einschränkung DES ZEITRAUMS selbst, unabhängig von Routensperren)."""
+    aktive = slot_wochentage_get(route_id, slot)
+    if not aktive:
+        return True
+    tag_datum = datetime.strptime(datum_str, "%d.%m.%Y").date()
+    return tag_datum.weekday() in aktive
+
 def route_existiert(route_id: str) -> bool:
     return route_id in data.get("routen", {})
 
@@ -193,6 +211,12 @@ def route_tag_status(route_id: str, datum: str):
         return False, f"🚫 Diese Route ist heute komplett gesperrt.{grund_text}"
     return True, None
 
+def slots_an_tag(route_id: str, datum: str) -> list:
+    """Alle Zeiträume einer Route, die an diesem konkreten Datum aktiv sind
+    (berücksichtigt die Pro-Zeitraum-Wochentags-Einschränkung)."""
+    route = data.get("routen", {}).get(route_id, {})
+    return [s for s in route.get("slots", []) if ist_slot_an_tag_aktiv(route_id, s, datum)]
+
 def datum_bereich(start_str: str, end_str: str) -> list:
     """Liste aller Datums-Strings (TT.MM.JJJJ) zwischen start und end (inklusive)."""
     start = datetime.strptime(start_str, "%d.%m.%Y").date()
@@ -207,11 +231,11 @@ def datum_bereich(start_str: str, end_str: str) -> list:
     return tage
 
 def get_tag_eintrag(route_id: str, datum: str) -> dict:
-    """Holt (oder erstellt) die Slot-Liste einer Route für ein Datum."""
+    """Holt (oder erstellt) die Slot-Liste einer Route für ein Datum.
+    Legt nur Einträge für Zeiträume an, die an diesem Wochentag aktiv sind."""
     route_tage = data.setdefault("tage", {}).setdefault(route_id, {})
     eintrag = route_tage.setdefault(datum, {})
-    route = data["routen"].get(route_id, {})
-    for slot in route.get("slots", []):
+    for slot in slots_an_tag(route_id, datum):
         eintrag.setdefault(slot, [])
     return eintrag
 
@@ -277,7 +301,8 @@ async def zeitraum_autocomplete(interaction: discord.Interaction, current: str):
     ergebnisse = []
     for slot in sorted(route["slots"], key=slot_sortier_schluessel):
         besetzt = len(eintrag.get(slot, []))
-        label = f"{slot_label(slot)} ({besetzt}/{route['kapazitaet']})"
+        tage_kuerzel = wochentage_anzeige(slot_wochentage_get(route_id, slot))
+        label = f"{slot_label(slot)} ({besetzt}/{route['kapazitaet']}, {tage_kuerzel})"
         if current.lower() in slot.lower():
             ergebnisse.append(app_commands.Choice(name=label[:100], value=slot))
     return ergebnisse[:25]
@@ -296,12 +321,15 @@ def build_wache_embed(route_id: str, datum: str, guild: discord.Guild) -> discor
     route = data["routen"][route_id]
     embed = discord.Embed(title=f"🛣️ {route['name']} – Heute ({datum})", color=EMBED_COLOR)
     eintrag = get_tag_eintrag(route_id, datum)
+    slots_heute = slots_an_tag(route_id, datum)
 
     if not route["slots"]:
         embed.description = "*Für diese Route sind noch keine Zeiträume konfiguriert.*"
+    elif not slots_heute:
+        embed.description = f"*Für {wochentag_name(datum)} sind keine Zeiträume konfiguriert.*"
     else:
         bloecke = []
-        for slot in sorted(route["slots"], key=slot_sortier_schluessel):
+        for slot in sorted(slots_heute, key=slot_sortier_schluessel):
             leute = eintrag.get(slot, [])
             namen = []
             for uid in leute:
@@ -337,7 +365,7 @@ class WacheView(discord.ui.View):
         today = heute_key()
         eintrag = get_tag_eintrag(self.route_id, today)
         offen, _ = route_tag_status(self.route_id, today)
-        for slot in sorted(route["slots"], key=slot_sortier_schluessel):
+        for slot in sorted(slots_an_tag(self.route_id, today), key=slot_sortier_schluessel):
             leute = eintrag.get(slot, [])
             voll = len(leute) >= route["kapazitaet"]
             button = discord.ui.Button(
@@ -384,6 +412,12 @@ class WacheView(discord.ui.View):
         if ist_tag_gesperrt(self.route_id, today) or not ist_wochentag_aktiv(self.route_id, today):
             _, banner_text = route_tag_status(self.route_id, today)
             await interaction.response.send_message(f"❌ {banner_text}", ephemeral=True)
+            return
+
+        if not ist_slot_an_tag_aktiv(self.route_id, slot, today):
+            await interaction.response.send_message(
+                f"❌ **{slot_label(slot)}** ist an {wochentag_name(today)}en nicht verfügbar.", ephemeral=True
+            )
             return
 
         if len(liste) >= route["kapazitaet"]:
@@ -504,22 +538,33 @@ def build_gesamtuebersicht_embed(route_id: str, guild: discord.Guild) -> discord
     route = data["routen"][route_id]
     zaehler = gesamt_zeit_pro_user(route_id)
 
-    if not zaehler:
-        beschreibung = "*Noch keine abgeschlossenen Wachen erfasst.*"
+    rolle = guild.get_role(ROSTER_ROLLE_ID) if guild else None
+    roster = rolle.members if rolle else []
+
+    if not roster:
+        beschreibung = "*Keine Mitglieder mit der Roster-Rolle gefunden.*"
     else:
-        sortiert = sorted(zaehler.items(), key=lambda x: x[1], reverse=True)
+        eintraege = [(member, zaehler.get(str(member.id), 0)) for member in roster]
+        stunden_ueber_null = [s for (_, s) in eintraege if s > 0]
+        durchschnitt = sum(stunden_ueber_null) / len(stunden_ueber_null) if stunden_ueber_null else 0
+
+        sortiert = sorted(eintraege, key=lambda x: x[1], reverse=True)
         zeilen = []
-        for i, (uid, stunden) in enumerate(sortiert, start=1):
-            member = guild.get_member(int(uid)) if guild else None
-            name = member.mention if member else f"Unbekanntes Mitglied ({uid})"
+        for i, (member, stunden) in enumerate(sortiert, start=1):
             stunden_text = f"{stunden:.1f}".rstrip("0").rstrip(".")
-            zeilen.append(f"**{i}.** {name} — **{stunden_text}h**")
+            if stunden <= 0:
+                hinweis = " ⚠️"
+            elif stunden < durchschnitt:
+                hinweis = " ℹ️"
+            else:
+                hinweis = ""
+            zeilen.append(f"**{i}.** {member.mention} — **{stunden_text}h**{hinweis}")
         beschreibung = "\n".join(zeilen)
         if len(beschreibung) > 4000:
             beschreibung = beschreibung[:4000] + "\n… (gekürzt)"
 
     embed = discord.Embed(title=f"📊 Gesamtübersicht – {route['name']}", description=beschreibung, color=EMBED_COLOR)
-    embed.set_footer(text="ECLIPSE – Summe aller abgeschlossenen Tage • täglich 00:01 Uhr aktualisiert")
+    embed.set_footer(text="ECLIPSE – Summe aller abgeschlossenen Tage • ⚠️ → keine Wache durchgeführt, ℹ️ → unter Durchschnitt • täglich 00:01 Uhr aktualisiert")
     embed.timestamp = datetime.now(TIMEZONE)
     return embed
 
@@ -566,6 +611,7 @@ async def route_erstellen(interaction: discord.Interaction, name: str, kapazitae
         "name": name,
         "kapazitaet": kapazitaet,
         "slots": list(STANDARD_SLOTS) if standard_zeitraeume else [],
+        "slot_wochentage": {},
         "channel_buttons": None,
         "stempel_nachricht_id": None,
         "channel_log": None,
@@ -613,11 +659,14 @@ async def route_loeschen(interaction: discord.Interaction, route: str):
     save_data(data)
     await interaction.response.send_message(f"🗑️ Route **{name}** (`{route}`) und alle zugehörigen Daten wurden gelöscht.", ephemeral=True)
 
-@tree.command(name="route_slot_hinzufuegen", description="Fügt einer Route einen Zeitraum hinzu (z.B. 18:00 bis 19:30)")
-@app_commands.describe(route="Die Route", start="Startzeit HH:MM, z.B. 18:00", ende="Endzeit HH:MM, z.B. 19:30")
+@tree.command(name="route_slot_hinzufuegen", description="Fügt einer Route einen Zeitraum hinzu (optional nur an bestimmten Wochentagen)")
+@app_commands.describe(
+    route="Die Route", start="Startzeit HH:MM, z.B. 18:00", ende="Endzeit HH:MM, z.B. 19:30",
+    tage="Optional: nur an diesen Wochentagen aktiv, z.B. 'Mo,Mi,Fr,So' (Standard: täglich)"
+)
 @app_commands.autocomplete(route=route_autocomplete)
 @app_commands.check(ist_admin_oder_leitung)
-async def route_slot_hinzufuegen(interaction: discord.Interaction, route: str, start: str, ende: str):
+async def route_slot_hinzufuegen(interaction: discord.Interaction, route: str, start: str, ende: str, tage: str = None):
     if route not in data.get("routen", {}):
         await interaction.response.send_message("❌ Route nicht gefunden.", ephemeral=True)
         return
@@ -626,15 +675,70 @@ async def route_slot_hinzufuegen(interaction: discord.Interaction, route: str, s
         await interaction.response.send_message("❌ Ungültiges Zeitformat. Bitte HH:MM verwenden, z.B. `18:00`.", ephemeral=True)
         return
 
+    wochentage = []
+    if tage:
+        try:
+            wochentage = parse_wochentage(tage)
+        except ValueError as e:
+            await interaction.response.send_message(
+                f"❌ {e}. Gültige Werte: Mo, Di, Mi, Do, Fr, Sa, So (kommagetrennt, z.B. `Mo,Mi,Fr,So`) oder `täglich`.",
+                ephemeral=True
+            )
+            return
+
     slot = f"{start}-{ende}"
-    slots = data["routen"][route]["slots"]
+    routeninfo = data["routen"][route]
+    slots = routeninfo["slots"]
     if slot in slots:
         await interaction.response.send_message(f"❌ Zeitraum **{slot_label(slot)}** existiert bereits.", ephemeral=True)
         return
 
     slots.append(slot)
+    slot_wt = routeninfo.setdefault("slot_wochentage", {})
+    if wochentage:
+        slot_wt[slot] = wochentage
+    else:
+        slot_wt.pop(slot, None)
     save_data(data)
-    await interaction.response.send_message(f"✅ Zeitraum **{slot_label(slot)}** zur Route hinzugefügt.", ephemeral=True)
+
+    tage_text = wochentage_anzeige(wochentage)
+    await interaction.response.send_message(
+        f"✅ Zeitraum **{slot_label(slot)}** zur Route hinzugefügt (aktiv: **{tage_text}**).", ephemeral=True
+    )
+    await refresh_wache_nachricht(route, interaction.guild)
+
+@tree.command(name="route_slot_wochentage_setzen", description="Ändert nachträglich, an welchen Wochentagen ein bereits vorhandener Zeitraum aktiv ist")
+@app_commands.describe(route="Die Route", zeitraum="Der Zeitraum", tage="z.B. 'Mo,Mi,Fr,So' oder 'täglich' für jeden Tag")
+@app_commands.autocomplete(route=route_autocomplete, zeitraum=zeitraum_autocomplete)
+@app_commands.check(ist_admin_oder_leitung)
+async def route_slot_wochentage_setzen(interaction: discord.Interaction, route: str, zeitraum: str, tage: str):
+    routeninfo = data.get("routen", {}).get(route)
+    if not routeninfo:
+        await interaction.response.send_message("❌ Route nicht gefunden.", ephemeral=True)
+        return
+    if zeitraum not in routeninfo["slots"]:
+        await interaction.response.send_message("❌ Dieser Zeitraum existiert bei dieser Route nicht.", ephemeral=True)
+        return
+    try:
+        wochentage = parse_wochentage(tage)
+    except ValueError as e:
+        await interaction.response.send_message(
+            f"❌ {e}. Gültige Werte: Mo, Di, Mi, Do, Fr, Sa, So (kommagetrennt, z.B. `Mo,Mi,Fr,So`) oder `täglich`.",
+            ephemeral=True
+        )
+        return
+
+    slot_wt = routeninfo.setdefault("slot_wochentage", {})
+    if wochentage:
+        slot_wt[zeitraum] = wochentage
+    else:
+        slot_wt.pop(zeitraum, None)
+    save_data(data)
+
+    tage_text = wochentage_anzeige(wochentage)
+    await interaction.response.send_message(
+        f"✅ **{slot_label(zeitraum)}** ist jetzt aktiv an: **{tage_text}**.", ephemeral=True
+    )
     await refresh_wache_nachricht(route, interaction.guild)
 
 @tree.command(name="route_slot_entfernen", description="Entfernt einen Zeitraum von einer Route")
@@ -642,11 +746,13 @@ async def route_slot_hinzufuegen(interaction: discord.Interaction, route: str, s
 @app_commands.autocomplete(route=route_autocomplete, zeitraum=zeitraum_autocomplete)
 @app_commands.check(ist_admin_oder_leitung)
 async def route_slot_entfernen(interaction: discord.Interaction, route: str, zeitraum: str):
-    slots = data.get("routen", {}).get(route, {}).get("slots", [])
+    routeninfo = data.get("routen", {}).get(route, {})
+    slots = routeninfo.get("slots", [])
     if zeitraum not in slots:
         await interaction.response.send_message("❌ Dieser Zeitraum existiert bei dieser Route nicht.", ephemeral=True)
         return
     slots.remove(zeitraum)
+    routeninfo.setdefault("slot_wochentage", {}).pop(zeitraum, None)
     save_data(data)
     await interaction.response.send_message(f"✅ Zeitraum **{slot_label(zeitraum)}** entfernt.", ephemeral=True)
     await refresh_wache_nachricht(route, interaction.guild)
@@ -851,7 +957,14 @@ async def routen_liste(interaction: discord.Interaction):
 
     embed = discord.Embed(title="🗺️ Konfigurierte Routen", color=EMBED_COLOR)
     for rid, info in routen.items():
-        slots_text = ", ".join(slot_label(s) for s in sorted(info["slots"], key=slot_sortier_schluessel)) or "*keine Zeiträume*"
+        slot_zeilen = []
+        for s in sorted(info["slots"], key=slot_sortier_schluessel):
+            wt = slot_wochentage_get(rid, s)
+            if wt:
+                slot_zeilen.append(f"{slot_label(s)} ({wochentage_anzeige(wt)})")
+            else:
+                slot_zeilen.append(slot_label(s))
+        slots_text = ", ".join(slot_zeilen) or "*keine Zeiträume*"
         btn_ch = f"<#{info['channel_buttons']}>" if info.get("channel_buttons") else "❌"
         log_ch = f"<#{info['channel_log']}>" if info.get("channel_log") else "❌"
         lb_ch = f"<#{info['channel_leaderboard']}>" if info.get("channel_leaderboard") else "❌"
@@ -860,7 +973,7 @@ async def routen_liste(interaction: discord.Interaction):
         wochentage_text = wochentage_anzeige(info.get("aktive_wochentage", []))
         embed.add_field(
             name=f"{info['name']} (`{rid}`)",
-            value=f"Kapazität: **{info['kapazitaet']}**/Zeitraum\nZeiträume: {slots_text}\nAktive Wochentage: **{wochentage_text}**\nButtons: {btn_ch} • Log: {log_ch} • Leaderboard: {lb_ch}{sperr_text}",
+            value=f"Kapazität: **{info['kapazitaet']}**/Zeitraum\nZeiträume: {slots_text}\nAktive Wochentage (Route): **{wochentage_text}**\nButtons: {btn_ch} • Log: {log_ch} • Leaderboard: {lb_ch}{sperr_text}",
             inline=False
         )
     await interaction.response.send_message(embed=embed, ephemeral=True)
@@ -904,6 +1017,14 @@ async def wache_eintragen(interaction: discord.Interaction, route: str, zeitraum
     if ist_tag_gesperrt(route, tag) or not ist_wochentag_aktiv(route, tag):
         _, banner_text = route_tag_status(route, tag)
         await interaction.response.send_message(f"❌ {banner_text}", ephemeral=True)
+        return
+
+    if not ist_slot_an_tag_aktiv(route, zeitraum, tag):
+        await interaction.response.send_message(
+            f"❌ **{slot_label(zeitraum)}** ist an {wochentag_name(tag)}en nicht verfügbar "
+            f"(aktiv: **{wochentage_anzeige(slot_wochentage_get(route, zeitraum))}**).",
+            ephemeral=True
+        )
         return
 
     eintrag = get_tag_eintrag(route, tag)
