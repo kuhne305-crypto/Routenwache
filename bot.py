@@ -134,6 +134,42 @@ def erstelle_route_id(name: str) -> str:
         i += 1
     return kandidat
 
+WOCHENTAG_KUERZEL = ["Mo", "Di", "Mi", "Do", "Fr", "Sa", "So"]
+WOCHENTAG_NAMEN = ["Montag", "Dienstag", "Mittwoch", "Donnerstag", "Freitag", "Samstag", "Sonntag"]
+WOCHENTAG_MAPPING = {
+    "mo": 0, "montag": 0, "di": 1, "dienstag": 1, "mi": 2, "mittwoch": 2,
+    "do": 3, "donnerstag": 3, "fr": 4, "freitag": 4, "sa": 5, "samstag": 5,
+    "so": 6, "sonntag": 6,
+}
+
+def parse_wochentage(text: str) -> list:
+    """Parst z.B. 'Mo,Mi,Fr' zu [0,2,4]. 'täglich'/'alle'/leer -> [] (=jeden Tag)."""
+    text = text.strip().lower()
+    if text in ("täglich", "taeglich", "alle", "jeden tag", ""):
+        return []
+    ergebnis = []
+    for teil in [t.strip() for t in text.replace(";", ",").split(",") if t.strip()]:
+        if teil not in WOCHENTAG_MAPPING:
+            raise ValueError(f"Unbekannter Wochentag: '{teil}'")
+        tag = WOCHENTAG_MAPPING[teil]
+        if tag not in ergebnis:
+            ergebnis.append(tag)
+    return sorted(ergebnis)
+
+def wochentage_anzeige(liste: list) -> str:
+    return "täglich" if not liste else ", ".join(WOCHENTAG_KUERZEL[i] for i in liste)
+
+def wochentag_name(datum_str: str) -> str:
+    d = datetime.strptime(datum_str, "%d.%m.%Y").date()
+    return WOCHENTAG_NAMEN[d.weekday()]
+
+def ist_wochentag_aktiv(route_id: str, datum_str: str) -> bool:
+    aktive = data.get("routen", {}).get(route_id, {}).get("aktive_wochentage", [])
+    if not aktive:
+        return True
+    tag_datum = datetime.strptime(datum_str, "%d.%m.%Y").date()
+    return tag_datum.weekday() in aktive
+
 def route_existiert(route_id: str) -> bool:
     return route_id in data.get("routen", {})
 
@@ -142,6 +178,20 @@ def ist_tag_gesperrt(route_id: str, datum: str) -> bool:
 
 def tag_sperrgrund(route_id: str, datum: str):
     return data.get("routen", {}).get(route_id, {}).get("gesperrte_tage", {}).get(datum)
+
+def route_tag_status(route_id: str, datum: str):
+    """Prüft BEIDE Sperr-Arten für einen Tag: die dauerhafte Wochentags-
+    Regel und eine manuelle Einzeltag-Sperre. Gibt (offen: bool,
+    banner_text: str|None) zurück."""
+    if not ist_wochentag_aktiv(route_id, datum):
+        route = data["routen"][route_id]
+        aktive_text = wochentage_anzeige(route.get("aktive_wochentage", []))
+        return False, f"📅 An {wochentag_name(datum)}en wird diese Route nicht bewacht. (Aktive Tage: {aktive_text})"
+    if ist_tag_gesperrt(route_id, datum):
+        grund = tag_sperrgrund(route_id, datum)
+        grund_text = f" Grund: {grund}" if grund else ""
+        return False, f"🚫 Diese Route ist heute komplett gesperrt.{grund_text}"
+    return True, None
 
 def datum_bereich(start_str: str, end_str: str) -> list:
     """Liste aller Datums-Strings (TT.MM.JJJJ) zwischen start und end (inklusive)."""
@@ -262,11 +312,9 @@ def build_wache_embed(route_id: str, datum: str, guild: discord.Guild) -> discor
             bloecke.append(f"**{slot_label(slot)}**{voll_hinweis}\n{text}")
         embed.description = "\n\n".join(bloecke)
 
-    if ist_tag_gesperrt(route_id, datum):
-        grund = tag_sperrgrund(route_id, datum)
-        grund_text = f" Grund: {grund}" if grund else ""
-        banner = f"🚫 **Diese Route ist heute komplett gesperrt.**{grund_text}\n\n"
-        embed.description = banner + (embed.description or "")
+    if ist_tag_gesperrt(route_id, datum) or not ist_wochentag_aktiv(route_id, datum):
+        _, banner_text = route_tag_status(route_id, datum)
+        embed.description = f"**{banner_text}**\n\n" + (embed.description or "")
 
     embed.set_footer(text=f"ECLIPSE – {route['name']} • Klicke einen Zeitraum an, um dich ein-/auszutragen (max. {route['kapazitaet']} Plätze/Zeitraum)")
     embed.timestamp = datetime.now(TIMEZONE)
@@ -288,14 +336,14 @@ class WacheView(discord.ui.View):
             return
         today = heute_key()
         eintrag = get_tag_eintrag(self.route_id, today)
-        tag_gesperrt = ist_tag_gesperrt(self.route_id, today)
+        offen, _ = route_tag_status(self.route_id, today)
         for slot in sorted(route["slots"], key=slot_sortier_schluessel):
             leute = eintrag.get(slot, [])
             voll = len(leute) >= route["kapazitaet"]
             button = discord.ui.Button(
-                label=f"{slot_label(slot)} ({len(leute)}/{route['kapazitaet']})" + (" 🚫" if tag_gesperrt else ""),
+                label=f"{slot_label(slot)} ({len(leute)}/{route['kapazitaet']})" + ("" if offen else " 🚫"),
                 style=discord.ButtonStyle.success if not voll else discord.ButtonStyle.danger,
-                disabled=tag_gesperrt,
+                disabled=not offen,
                 custom_id=f"wache_{self.route_id}_{slot}",
             )
             button.callback = self._make_callback(slot)
@@ -333,10 +381,9 @@ class WacheView(discord.ui.View):
             )
             return
 
-        if ist_tag_gesperrt(self.route_id, today):
-            grund = tag_sperrgrund(self.route_id, today)
-            grund_text = f" Grund: {grund}" if grund else ""
-            await interaction.response.send_message(f"❌ Diese Route ist heute komplett gesperrt.{grund_text}", ephemeral=True)
+        if ist_tag_gesperrt(self.route_id, today) or not ist_wochentag_aktiv(self.route_id, today):
+            _, banner_text = route_tag_status(self.route_id, today)
+            await interaction.response.send_message(f"❌ {banner_text}", ephemeral=True)
             return
 
         if len(liste) >= route["kapazitaet"]:
@@ -526,6 +573,7 @@ async def route_erstellen(interaction: discord.Interaction, name: str, kapazitae
         "leaderboard_nachricht_id": None,
         "ping_rolle_id": None,
         "gesperrte_tage": {},
+        "aktive_wochentage": [],
     }
     save_data(data)
     zeitraeume_text = (
@@ -696,6 +744,33 @@ async def route_tag_entsperren(interaction: discord.Interaction, route: str, dat
     if heute_key() in tage_liste:
         await refresh_wache_nachricht(route, interaction.guild)
 
+@tree.command(name="route_wochentage_setzen", description="Legt DAUERHAFT fest, an welchen Wochentagen eine Route bewacht wird")
+@app_commands.describe(route="Die Route", tage="z.B. 'Mo,Mi,Fr' oder 'täglich' für jeden Tag")
+@app_commands.autocomplete(route=route_autocomplete)
+@app_commands.check(ist_admin_oder_leitung)
+async def route_wochentage_setzen(interaction: discord.Interaction, route: str, tage: str):
+    if route not in data.get("routen", {}):
+        await interaction.response.send_message("❌ Route nicht gefunden.", ephemeral=True)
+        return
+    try:
+        wochentage = parse_wochentage(tage)
+    except ValueError as e:
+        await interaction.response.send_message(
+            f"❌ {e}. Gültige Werte: Mo, Di, Mi, Do, Fr, Sa, So (kommagetrennt, z.B. `Mo,Mi,Fr`) oder `täglich`.",
+            ephemeral=True
+        )
+        return
+
+    data["routen"][route]["aktive_wochentage"] = wochentage
+    save_data(data)
+    anzeige = wochentage_anzeige(wochentage)
+    await interaction.response.send_message(
+        f"✅ **{data['routen'][route]['name']}** wird jetzt an: **{anzeige}** bewacht.\n"
+        f"An allen anderen Tagen wird die Route automatisch geschlossen (Buttons deaktiviert).",
+        ephemeral=True
+    )
+    await refresh_wache_nachricht(route, interaction.guild)
+
 @tree.command(name="route_channel_buttons_setzen", description="Setzt den Channel für die Ein-/Austragen-Buttons einer Route")
 @app_commands.autocomplete(route=route_autocomplete)
 @app_commands.check(ist_admin_oder_leitung)
@@ -782,9 +857,10 @@ async def routen_liste(interaction: discord.Interaction):
         lb_ch = f"<#{info['channel_leaderboard']}>" if info.get("channel_leaderboard") else "❌"
         gesperrte_tage = info.get("gesperrte_tage", {})
         sperr_text = f"\nGesperrte Tage: {', '.join(sorted(gesperrte_tage.keys()))}" if gesperrte_tage else ""
+        wochentage_text = wochentage_anzeige(info.get("aktive_wochentage", []))
         embed.add_field(
             name=f"{info['name']} (`{rid}`)",
-            value=f"Kapazität: **{info['kapazitaet']}**/Zeitraum\nZeiträume: {slots_text}\nButtons: {btn_ch} • Log: {log_ch} • Leaderboard: {lb_ch}{sperr_text}",
+            value=f"Kapazität: **{info['kapazitaet']}**/Zeitraum\nZeiträume: {slots_text}\nAktive Wochentage: **{wochentage_text}**\nButtons: {btn_ch} • Log: {log_ch} • Leaderboard: {lb_ch}{sperr_text}",
             inline=False
         )
     await interaction.response.send_message(embed=embed, ephemeral=True)
@@ -825,10 +901,9 @@ async def wache_eintragen(interaction: discord.Interaction, route: str, zeitraum
     else:
         tag = heute_key()
 
-    if ist_tag_gesperrt(route, tag):
-        grund = tag_sperrgrund(route, tag)
-        grund_text = f" Grund: {grund}" if grund else ""
-        await interaction.response.send_message(f"❌ **{tag}** ist für diese Route komplett gesperrt.{grund_text}", ephemeral=True)
+    if ist_tag_gesperrt(route, tag) or not ist_wochentag_aktiv(route, tag):
+        _, banner_text = route_tag_status(route, tag)
+        await interaction.response.send_message(f"❌ {banner_text}", ephemeral=True)
         return
 
     eintrag = get_tag_eintrag(route, tag)
