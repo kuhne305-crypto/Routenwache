@@ -1,42 +1,37 @@
 import discord
 from discord.ext import commands, tasks
 from discord import app_commands
-from datetime import datetime, time as dt_time
+from datetime import datetime, time as dt_time, timedelta
 import pytz
 import json
 import os
+import re
 
 # ════════════════════════════════════════════════════════════════════════════
 # ⚙️  KONFIGURATION
 # ════════════════════════════════════════════════════════════════════════════
 TOKEN    = os.environ.get("DISCORD_TOKEN")
-# Fallback auf deine Server-ID, falls die Railway-Variable GUILD_ID mal
-# fehlt oder leer ist – die Variable hat aber weiterhin Vorrang, wenn sie
-# gesetzt ist.
 GUILD_ID = os.environ.get("GUILD_ID") or "1526202327365582910"
 TIMEZONE = pytz.timezone("Europe/Berlin")
 EMBED_COLOR = 0xFFD700  # Gelb
 DATA_DIR  = "/data" if os.path.isdir("/data") else "."
 DATA_FILE = os.path.join(DATA_DIR, "data.json")
 
-# Feste Zeiträume der Routenwache, jeweils max. 3 Plätze.
-SLOTS = ["20-21", "21-22", "22-23", "23-24"]
-MAX_PLAETZE_PRO_SLOT = 3
-
-# Maximal so viele Zeiträume darf sich EIN Mitglied gleichzeitig an einem Tag eintragen.
+# Wie viele Zeiträume darf EIN Mitglied an EINEM Tag auf DERSELBEN Route
+# gleichzeitig eingetragen sein (z.B. zwei aufeinanderfolgende Schichten).
 MAX_ZEITRAEUME_PRO_USER = 2
 
-# Leitung: darf das Setup (Channel setzen, Nachricht posten, Nachtragen) erledigen.
+# "Morteco-Vorlage": Diese Zeiträume bekommt JEDE neu erstellte Route
+# automatisch (kann bei /route_erstellen mit standard_zeitraeume:False
+# abgeschaltet werden, dann startet die Route ohne Zeiträume).
+STANDARD_SLOTS = ["18:00-19:30", "19:30-21:00", "21:00-22:30", "22:30-00:00"]
+
+# Leitung: darf Routen verwalten, Channels setzen, Routensperren verhängen.
 # Ein-/Austragen in einen Zeitraum ist bewusst für ALLE offen.
 LEITUNG_ROLLE_ID = 1526202327483285629
 
-# Alle Mitglieder mit dieser Rolle erscheinen im Leaderboard – auch mit 0 Stunden.
-ROUTENWACHE_ROLLE_ID = 1526202327365582918
-
 
 def ist_admin_oder_leitung(interaction: discord.Interaction) -> bool:
-    """True für echte Admins ODER Mitglieder mit der Leitungs-Rolle.
-    Wird nur für die Setup-/Korrektur-Befehle benutzt."""
     if interaction.user.guild_permissions.administrator:
         return True
     return any(r.id == LEITUNG_ROLLE_ID for r in interaction.user.roles)
@@ -45,19 +40,27 @@ def ist_admin_oder_leitung(interaction: discord.Interaction) -> bool:
 # ════════════════════════════════════════════════════════════════════════════
 # 💾  DATENSPEICHER
 # ════════════════════════════════════════════════════════════════════════════
-# Hinweis: Die Feldnamen bleiben bewusst so, wie sie schon in data.json auf
-# dem Server stehen (channel_stempel, channel_stempel_liste,
-# channel_gesamtuebersicht, ...) – damit beim Deploy nichts von der
-# bestehenden Konfiguration (bereits gesetzte Channels) verloren geht.
+# Struktur:
+# "routen": {
+#     "morteco_heroin_route": {
+#         "name": "Morteco Heroin Route",
+#         "kapazitaet": 2,
+#         "slots": ["18:00-19:30", "19:30-21:00"],   # frei konfigurierbar, beliebig viele
+#         "channel_buttons": 123, "stempel_nachricht_id": "456",
+#         "channel_log": 123,
+#         "channel_leaderboard": 123, "leaderboard_nachricht_id": "456",
+#         "ping_rolle_id": None,   # optional: wird beim Tageswechsel geist-gepingt
+#         "gesperrte_tage": {"29.07.2026": "keine Zeit"},  # Tag -> Grund (optional)
+#     }, ...
+# }
+# "tage": { "morteco_heroin_route": { "29.07.2026": { "18:00-19:30": ["uid", ...] } } }
+# "gesperrte_user": ["uid", ...]   # globale Routensperre, gilt für ALLE Routen
 
 STANDARD_DATEN = {
-    "channel_stempel": 1531376112226140260,          # Buttons-Channel (Eintragen)
-    "stempel_nachricht_id": None,
-    "channel_stempel_liste": 1531376274130341909,     # Log-Channel (täglicher Post um 00:01 Uhr)
-    "channel_gesamtuebersicht": None,                 # Leaderboard-Channel (/set_leaderboard)
-    "gesamtuebersicht_nachricht_id": None,
-    "tage": {},  # { "28.07.2026": { "20-21": ["userid", ...], "21-22": [...], ... } }
-    "globale_befehle_bereinigt": False,  # wird nach der einmaligen Bereinigung auf True gesetzt
+    "routen": {},
+    "tage": {},
+    "gesperrte_user": [],
+    "globale_befehle_bereinigt": False,
 }
 
 def load_data() -> dict:
@@ -66,10 +69,8 @@ def load_data() -> dict:
             geladen = json.load(f)
     else:
         geladen = {}
-
     if not geladen:
         return dict(STANDARD_DATEN)
-
     for key, wert in STANDARD_DATEN.items():
         geladen.setdefault(key, wert)
     return geladen
@@ -96,14 +97,12 @@ tree = bot.tree
 # 🧰  HILFSFUNKTIONEN
 # ════════════════════════════════════════════════════════════════════════════
 
+ZEIT_REGEX = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
+
 def heute_key() -> str:
-    """Aktuelles Datum als String, z.B. '29.07.2026'."""
     return datetime.now(TIMEZONE).strftime("%d.%m.%Y")
 
 def parse_datum(datum_str: str) -> str:
-    """Validiert eine Nutzereingabe im Format TT.MM.JJJJ und gibt sie
-    normalisiert zurück (z.B. '3.7.2026' -> '03.07.2026').
-    Wirft ValueError bei ungültigem Format."""
     geparst = datetime.strptime(datum_str.strip(), "%d.%m.%Y")
     return geparst.strftime("%d.%m.%Y")
 
@@ -111,98 +110,193 @@ def slot_label(slot: str) -> str:
     start, ende = slot.split("-")
     return f"{start} - {ende} Uhr"
 
-def get_tag_eintrag(datum: str) -> dict:
-    """Holt (oder erstellt) die Slot-Liste für ein bestimmtes Datum."""
-    tage = data.setdefault("tage", {})
-    eintrag = tage.setdefault(datum, {})
-    for slot in SLOTS:
+def slot_sortier_schluessel(slot: str) -> int:
+    h, m = slot.split("-")[0].split(":")
+    return int(h) * 60 + int(m)
+
+def slot_dauer_stunden(slot: str) -> float:
+    """Dauer eines Zeitraums in Stunden, inkl. Über-Mitternacht-Slots
+    wie '22:30-00:00' (ergibt dann 1.5h statt eines negativen Werts)."""
+    start_str, ende_str = slot.split("-")
+    start = datetime.strptime(start_str, "%H:%M")
+    ende = datetime.strptime(ende_str, "%H:%M")
+    diff = (ende - start).total_seconds() / 3600
+    if diff <= 0:
+        diff += 24
+    return diff
+
+def erstelle_route_id(name: str) -> str:
+    basis = re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_") or "route"
+    kandidat = basis
+    i = 2
+    while kandidat in data.get("routen", {}):
+        kandidat = f"{basis}_{i}"
+        i += 1
+    return kandidat
+
+def route_existiert(route_id: str) -> bool:
+    return route_id in data.get("routen", {})
+
+def ist_tag_gesperrt(route_id: str, datum: str) -> bool:
+    return datum in data.get("routen", {}).get(route_id, {}).get("gesperrte_tage", {})
+
+def tag_sperrgrund(route_id: str, datum: str):
+    return data.get("routen", {}).get(route_id, {}).get("gesperrte_tage", {}).get(datum)
+
+def datum_bereich(start_str: str, end_str: str) -> list:
+    """Liste aller Datums-Strings (TT.MM.JJJJ) zwischen start und end (inklusive)."""
+    start = datetime.strptime(start_str, "%d.%m.%Y").date()
+    ende = datetime.strptime(end_str, "%d.%m.%Y").date()
+    if ende < start:
+        start, ende = ende, start
+    tage = []
+    aktuell = start
+    while aktuell <= ende:
+        tage.append(aktuell.strftime("%d.%m.%Y"))
+        aktuell += timedelta(days=1)
+    return tage
+
+def get_tag_eintrag(route_id: str, datum: str) -> dict:
+    """Holt (oder erstellt) die Slot-Liste einer Route für ein Datum."""
+    route_tage = data.setdefault("tage", {}).setdefault(route_id, {})
+    eintrag = route_tage.setdefault(datum, {})
+    route = data["routen"].get(route_id, {})
+    for slot in route.get("slots", []):
         eintrag.setdefault(slot, [])
     return eintrag
 
 def alle_slots_von_user(eintrag: dict, uid: str) -> list:
-    """Gibt ALLE Slots zurück, in denen uid an diesem Tag eingetragen ist
-    (kann mehrere sein, da Mehrfach-Eintragung erlaubt ist, aktuell max.
-    MAX_ZEITRAEUME_PRO_USER gleichzeitig über die Buttons)."""
     return [slot for slot, liste in eintrag.items() if uid in liste]
 
-def gesamt_zeit_pro_user() -> dict:
-    """Zählt für jeden User, in wie vielen Zeitraum-Slots (= Stunden) er
-    insgesamt eingetragen war – aber NUR über bereits ABGESCHLOSSENE Tage.
-    Der heutige, noch laufende Tag zählt bewusst noch nicht mit, da er
-    sich noch ändern kann (Ein-/Austragen läuft ja noch)."""
+def gesamt_zeit_pro_user(route_id: str) -> dict:
+    """Summiert für jeden User die Stunden auf ABGESCHLOSSENEN Tagen
+    (heute und Zukunft zählen bewusst noch nicht mit)."""
     zaehler = {}
-    heute = heute_key()
-    for datum, eintrag in data.get("tage", {}).items():
-        if datum == heute:
+    heute = datetime.now(TIMEZONE).date()
+    for datum, eintrag in data.get("tage", {}).get(route_id, {}).items():
+        try:
+            tag_datum = datetime.strptime(datum, "%d.%m.%Y").date()
+        except ValueError:
+            continue
+        if tag_datum >= heute:
             continue
         for slot, liste in eintrag.items():
+            dauer = slot_dauer_stunden(slot)
             for uid in liste:
-                zaehler[uid] = zaehler.get(uid, 0) + 1
+                zaehler[uid] = zaehler.get(uid, 0) + dauer
     return zaehler
 
+def entferne_aus_allen_zukuenftigen_eintraegen(uid: str) -> list:
+    """Entfernt uid aus allen HEUTIGEN/ZUKÜNFTIGEN Einträgen (über alle
+    Routen hinweg) – wird beim Verhängen einer Routensperre benutzt.
+    Vergangene, bereits abgeschlossene Tage bleiben unangetastet.
+    Gibt eine Liste von (route_id, datum, slot) zurück, aus denen entfernt wurde."""
+    heute = datetime.now(TIMEZONE).date()
+    entfernte = []
+    for route_id, tage_dict in data.get("tage", {}).items():
+        for datum, eintrag in tage_dict.items():
+            try:
+                tag_datum = datetime.strptime(datum, "%d.%m.%Y").date()
+            except ValueError:
+                continue
+            if tag_datum < heute:
+                continue
+            for slot, liste in eintrag.items():
+                if uid in liste:
+                    liste.remove(uid)
+                    entfernte.append((route_id, datum, slot))
+    return entfernte
+
+
+# ─── Autocomplete ──────────────────────────────────────────────────────────
+async def route_autocomplete(interaction: discord.Interaction, current: str):
+    ergebnisse = []
+    for rid, info in data.get("routen", {}).items():
+        label = f"{info['name']} ({rid})"
+        if current.lower() in label.lower():
+            ergebnisse.append(app_commands.Choice(name=label[:100], value=rid))
+    return ergebnisse[:25]
+
+async def zeitraum_autocomplete(interaction: discord.Interaction, current: str):
+    route_id = getattr(interaction.namespace, "route", None)
+    route = data.get("routen", {}).get(route_id)
+    if not route:
+        return []
+    heute = heute_key()
+    eintrag = get_tag_eintrag(route_id, heute)
+    ergebnisse = []
+    for slot in sorted(route["slots"], key=slot_sortier_schluessel):
+        besetzt = len(eintrag.get(slot, []))
+        label = f"{slot_label(slot)} ({besetzt}/{route['kapazitaet']})"
+        if current.lower() in slot.lower():
+            ergebnisse.append(app_commands.Choice(name=label[:100], value=slot))
+    return ergebnisse[:25]
+
 
 # ════════════════════════════════════════════════════════════════════════════
-# 🛣️  ROUTENWACHE-BUTTONS (Eintragen für den heutigen Tag)
+# 🛣️  ROUTENWACHE-BUTTONS (pro Route eine eigene, persistente Nachricht)
 # ════════════════════════════════════════════════════════════════════════════
-# Komplett offen: es gibt hier absichtlich KEINE Rollen-/Berechtigungs-
-# einschränkung. Jedes Mitglied kann sich für bis zu MAX_ZEITRAEUME_PRO_USER
-# Zeiträume gleichzeitig ein-/austragen.
-#
-# WICHTIG (Discord-Limitierung): Die Buttons-Nachricht ist EINE einzige
-# Nachricht, die ALLE Mitglieder gleich sehen. Discord erlaubt es nicht,
-# einem einzelnen Nutzer einen anderen Button-Zustand (z.B. "ausgegraut")
-# anzuzeigen als allen anderen. Ein "voller" oder "für dich nicht mehr
-# verfügbarer" Zeitraum kann daher NICHT visuell nur für bestimmte Personen
-# deaktiviert werden. Stattdessen bleiben die Buttons für alle klickbar,
-# und die Regeln (voll / max. Zeiträume erreicht) werden beim Klick geprüft:
-# wer nicht berechtigt ist, bekommt eine kurze private (ephemere) Fehler-
-# meldung statt der Eintragung. Wer selbst schon in einem Zeitraum steht,
-# kann sich dort IMMER wieder austragen – auch wenn der Zeitraum inzwischen
-# voll ist.
+# WICHTIG (Discord-Limitierung): Eine Buttons-Nachricht sehen alle Mitglieder
+# gleich. Ein "für dich voller" Zeitraum kann nicht nur für einzelne Personen
+# ausgegraut werden. Volle Zeiträume werden daher ROT eingefärbt, bleiben
+# aber klickbar; die Regeln (voll / Routensperre / max. Zeiträume) werden
+# beim Klick geprüft, wer nicht darf bekommt eine private Fehlermeldung.
 
-def build_wache_embed(datum: str, guild: discord.Guild) -> discord.Embed:
-    embed = discord.Embed(title=f"🛣️ Routenwache Heute ({datum})", color=EMBED_COLOR)
-    eintrag = get_tag_eintrag(datum)
+def build_wache_embed(route_id: str, datum: str, guild: discord.Guild) -> discord.Embed:
+    route = data["routen"][route_id]
+    embed = discord.Embed(title=f"🛣️ {route['name']} – Heute ({datum})", color=EMBED_COLOR)
+    eintrag = get_tag_eintrag(route_id, datum)
 
-    bloecke = []
-    for slot in SLOTS:
-        leute = eintrag.get(slot, [])
-        namen = []
-        for uid in leute:
-            member = guild.get_member(int(uid)) if guild else None
-            namen.append(member.mention if member else f"Unbekanntes Mitglied ({uid})")
-        text = "\n".join(namen) if namen else "noch unbesetzt"
-        voll_hinweis = " 🔒 (voll)" if len(leute) >= MAX_PLAETZE_PRO_SLOT else ""
-        bloecke.append(f"**{slot_label(slot)}**{voll_hinweis}\n{text}")
+    if not route["slots"]:
+        embed.description = "*Für diese Route sind noch keine Zeiträume konfiguriert.*"
+    else:
+        bloecke = []
+        for slot in sorted(route["slots"], key=slot_sortier_schluessel):
+            leute = eintrag.get(slot, [])
+            namen = []
+            for uid in leute:
+                member = guild.get_member(int(uid)) if guild else None
+                namen.append(member.mention if member else f"Unbekanntes Mitglied ({uid})")
+            text = "\n".join(namen) if namen else "noch unbesetzt"
+            voll_hinweis = " 🔒 (voll)" if len(leute) >= route["kapazitaet"] else ""
+            bloecke.append(f"**{slot_label(slot)}**{voll_hinweis}\n{text}")
+        embed.description = "\n\n".join(bloecke)
 
-    embed.description = "\n\n".join(bloecke)
-    embed.set_footer(text=f"ECLIPSE – Routenwache • Klicke einen Zeitraum an, um dich ein- oder wieder auszutragen (max. 3 Plätze pro Stunde, max. {MAX_ZEITRAEUME_PRO_USER} Zeiträume gleichzeitig pro Person)")
+    if ist_tag_gesperrt(route_id, datum):
+        grund = tag_sperrgrund(route_id, datum)
+        grund_text = f" Grund: {grund}" if grund else ""
+        banner = f"🚫 **Diese Route ist heute komplett gesperrt.**{grund_text}\n\n"
+        embed.description = banner + (embed.description or "")
+
+    embed.set_footer(text=f"ECLIPSE – {route['name']} • Klicke einen Zeitraum an, um dich ein-/auszutragen (max. {route['kapazitaet']} Plätze/Zeitraum)")
     embed.timestamp = datetime.now(TIMEZONE)
     return embed
 
 
 class WacheView(discord.ui.View):
-    """Persistente View mit einem Button pro Zeitraum. Ein voller Zeitraum
-    wird ROT eingefärbt (statt grün), bleibt aber klickbar – Details siehe
-    Kommentar oben zur Discord-Limitierung. Ob ein Klick tatsächlich etwas
-    bewirkt, entscheidet handle_click() anhand der aktuellen Regeln."""
+    """Persistente View mit einem Button pro Zeitraum EINER Route."""
 
-    def __init__(self):
+    def __init__(self, route_id: str):
         super().__init__(timeout=None)
+        self.route_id = route_id
         self.build_buttons()
 
     def build_buttons(self):
         self.clear_items()
+        route = data["routen"].get(self.route_id)
+        if not route:
+            return
         today = heute_key()
-        eintrag = get_tag_eintrag(today)
-        for slot in SLOTS:
+        eintrag = get_tag_eintrag(self.route_id, today)
+        tag_gesperrt = ist_tag_gesperrt(self.route_id, today)
+        for slot in sorted(route["slots"], key=slot_sortier_schluessel):
             leute = eintrag.get(slot, [])
-            voll = len(leute) >= MAX_PLAETZE_PRO_SLOT
+            voll = len(leute) >= route["kapazitaet"]
             button = discord.ui.Button(
-                label=f"{slot_label(slot)} ({len(leute)}/{MAX_PLAETZE_PRO_SLOT})",
+                label=f"{slot_label(slot)} ({len(leute)}/{route['kapazitaet']})" + (" 🚫" if tag_gesperrt else ""),
                 style=discord.ButtonStyle.success if not voll else discord.ButtonStyle.danger,
-                disabled=False,
-                custom_id=f"wache_slot_{slot}",
+                disabled=tag_gesperrt,
+                custom_id=f"wache_{self.route_id}_{slot}",
             )
             button.callback = self._make_callback(slot)
             self.add_item(button)
@@ -213,41 +307,51 @@ class WacheView(discord.ui.View):
         return callback
 
     async def handle_click(self, interaction: discord.Interaction, slot: str):
-        today = heute_key()
-        eintrag = get_tag_eintrag(today)
+        route = data["routen"].get(self.route_id)
+        if not route:
+            await interaction.response.send_message("❌ Diese Route existiert nicht mehr.", ephemeral=True)
+            return
+
         uid = str(interaction.user.id)
+        today = heute_key()
+        eintrag = get_tag_eintrag(self.route_id, today)
         liste = eintrag.setdefault(slot, [])
 
-        # Bereits in DIESEM Zeitraum eingetragen -> IMMER wieder austragen
-        # erlaubt, auch wenn der Zeitraum inzwischen voll geworden ist.
+        # Bereits eingetragen -> IMMER wieder austragen erlaubt, auch wenn voll.
         if uid in liste:
             liste.remove(uid)
             save_data(data)
             self.build_buttons()
-
-            embed = build_wache_embed(today, interaction.guild)
+            embed = build_wache_embed(self.route_id, today, interaction.guild)
             await interaction.response.edit_message(embed=embed, view=self)
-            await interaction.followup.send(
-                f"🔴 Du wurdest aus **{slot_label(slot)}** ausgetragen.", ephemeral=True
+            await interaction.followup.send(f"🔴 Du wurdest aus **{slot_label(slot)}** ausgetragen.", ephemeral=True)
+            return
+
+        if uid in data.get("gesperrte_user", []):
+            await interaction.response.send_message(
+                "❌ Du hast aktuell eine Routensperre und kannst dich nicht eintragen.", ephemeral=True
             )
             return
 
-        # Zeitraum ist voll und der Klickende ist NICHT drin -> ablehnen
-        if len(liste) >= MAX_PLAETZE_PRO_SLOT:
+        if ist_tag_gesperrt(self.route_id, today):
+            grund = tag_sperrgrund(self.route_id, today)
+            grund_text = f" Grund: {grund}" if grund else ""
+            await interaction.response.send_message(f"❌ Diese Route ist heute komplett gesperrt.{grund_text}", ephemeral=True)
+            return
+
+        if len(liste) >= route["kapazitaet"]:
             await interaction.response.send_message(
-                f"❌ **{slot_label(slot)}** ist bereits voll ({MAX_PLAETZE_PRO_SLOT}/{MAX_PLAETZE_PRO_SLOT}). "
-                f"Nur Mitglieder, die dort schon eingetragen sind, können sich hier wieder austragen.",
+                f"❌ **{slot_label(slot)}** ist bereits voll ({route['kapazitaet']}/{route['kapazitaet']}).",
                 ephemeral=True
             )
             return
 
-        # Maximale Anzahl gleichzeitiger Zeiträume für diesen User erreicht
         aktuelle_slots = alle_slots_von_user(eintrag, uid)
         if len(aktuelle_slots) >= MAX_ZEITRAEUME_PRO_USER:
             vorhandene = ", ".join(f"**{slot_label(s)}**" for s in aktuelle_slots)
             await interaction.response.send_message(
                 f"❌ Du bist bereits in {MAX_ZEITRAEUME_PRO_USER} Zeiträumen eingetragen ({vorhandene}). "
-                f"Trage dich zuerst aus einem davon aus, um dich für einen weiteren Zeitraum einzutragen.",
+                f"Trage dich zuerst aus einem davon aus.",
                 ephemeral=True
             )
             return
@@ -255,57 +359,53 @@ class WacheView(discord.ui.View):
         liste.append(uid)
         save_data(data)
         self.build_buttons()
-
-        embed = build_wache_embed(today, interaction.guild)
+        embed = build_wache_embed(self.route_id, today, interaction.guild)
         await interaction.response.edit_message(embed=embed, view=self)
         await interaction.followup.send(f"🟢 Du bist eingetragen für **{slot_label(slot)}**!", ephemeral=True)
 
 
-wache_view: "WacheView | None" = None
+wache_views: dict = {}  # route_id -> WacheView
 
-async def refresh_wache_nachricht(guild: discord.Guild):
-    """Editiert (oder postet erstmalig) die EINE Buttons-Nachricht im
-    Routenwache-Channel. Läuft live – bei jedem Ein-/Austragen."""
-    if not data.get("channel_stempel"):
+async def refresh_wache_nachricht(route_id: str, guild: discord.Guild):
+    route = data.get("routen", {}).get(route_id)
+    if not route or not route.get("channel_buttons"):
         return
-    kanal = guild.get_channel(int(data["channel_stempel"]))
+    kanal = guild.get_channel(int(route["channel_buttons"]))
     if not kanal:
         return
 
-    today = heute_key()
-    wache_view.build_buttons()
-    embed = build_wache_embed(today, guild)
+    view = wache_views.get(route_id)
+    if view is None:
+        view = WacheView(route_id)
+        wache_views[route_id] = view
+    view.build_buttons()
 
-    msg_id = data.get("stempel_nachricht_id")
+    today = heute_key()
+    embed = build_wache_embed(route_id, today, guild)
+
+    msg_id = route.get("stempel_nachricht_id")
     if msg_id:
         try:
             msg = await kanal.fetch_message(int(msg_id))
-            await msg.edit(embed=embed, view=wache_view)
+            await msg.edit(embed=embed, view=view)
             return
         except Exception as e:
-            print(f"Alte Routenwache-Nachricht nicht gefunden, poste neu: {e}")
+            print(f"Alte Buttons-Nachricht ({route_id}) nicht gefunden, poste neu: {e}")
 
-    msg = await kanal.send(embed=embed, view=wache_view)
-    data["stempel_nachricht_id"] = str(msg.id)
+    msg = await kanal.send(embed=embed, view=view)
+    route["stempel_nachricht_id"] = str(msg.id)
     save_data(data)
 
 
-async def geist_ping_neues_datum(guild: discord.Guild):
-    """Pingt die Routenwache-Rolle EINMAL im Buttons-Channel und löscht die
-    Ping-Nachricht sofort wieder (klassischer 'Geist-Ping'): Die Mitglieder
-    bekommen die Erwähnungs-Benachrichtigung, aber im Channel bleibt nichts
-    stehen. Wird bewusst NUR aufgerufen, wenn sich das Datum in der
-    Routenwache-Nachricht wirklich ändert (Tageswechsel um 00:01 Uhr) –
-    NICHT bei jedem normalen Ein-/Austragen-Update."""
-    if not data.get("channel_stempel"):
+async def geist_ping_neues_datum(route_id: str, guild: discord.Guild):
+    route = data.get("routen", {}).get(route_id)
+    if not route or not route.get("channel_buttons") or not route.get("ping_rolle_id"):
         return
-    kanal = guild.get_channel(int(data["channel_stempel"]))
+    kanal = guild.get_channel(int(route["channel_buttons"]))
     if not kanal:
         return
-
-    rolle = guild.get_role(ROUTENWACHE_ROLLE_ID)
-    mention_text = rolle.mention if rolle else f"<@&{ROUTENWACHE_ROLLE_ID}>"
-
+    rolle = guild.get_role(int(route["ping_rolle_id"]))
+    mention_text = rolle.mention if rolle else f"<@&{route['ping_rolle_id']}>"
     try:
         ping_msg = await kanal.send(
             mention_text,
@@ -313,306 +413,479 @@ async def geist_ping_neues_datum(guild: discord.Guild):
         )
         await ping_msg.delete()
     except Exception as e:
-        print(f"❌ Fehler beim Geist-Ping: {e}")
+        print(f"❌ Fehler beim Geist-Ping ({route_id}): {e}")
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# 📋  TAGES-LOG (ein neuer Post pro abgeschlossenem Tag, um 00:01 Uhr)
+# 📋  TAGES-LOG (ein neuer Post pro abgeschlossenem Tag, je Route)
 # ════════════════════════════════════════════════════════════════════════════
 
-def build_tages_log_embed(datum: str, guild: discord.Guild) -> discord.Embed:
-    """Baut den Log-Embed für einen ABGESCHLOSSENEN Tag – wer war wann
-    (welcher Zeitraum) eingetragen. Kompakte nummerierte Liste, analog zur
-    Gesamtübersicht, hier aber 'wer war wann eingetragen' statt Stunden."""
-    eintrag = data.get("tage", {}).get(datum, {})
+def build_tages_log_embed(route_id: str, datum: str, guild: discord.Guild) -> discord.Embed:
+    route = data["routen"][route_id]
+    eintrag = data.get("tage", {}).get(route_id, {}).get(datum, {})
 
     zeilen = []
-    for slot in SLOTS:
+    for slot in sorted(eintrag.keys(), key=slot_sortier_schluessel):
         for uid in eintrag.get(slot, []):
             member = guild.get_member(int(uid)) if guild else None
             name = member.mention if member else f"Unbekanntes Mitglied ({uid})"
             zeilen.append(f"{name} — **{slot_label(slot)}**")
 
-    if zeilen:
-        beschreibung = "\n".join(f"{i}. {zeile}" for i, zeile in enumerate(zeilen, start=1))
-    else:
-        beschreibung = "Niemand war an diesem Tag für die Routenwache eingetragen."
+    beschreibung = "\n".join(f"{i}. {z}" for i, z in enumerate(zeilen, start=1)) if zeilen else \
+        "Niemand war an diesem Tag eingetragen."
 
-    embed = discord.Embed(
-        title=f"📋 Routenwache-Log ({datum})",
-        description=beschreibung,
-        color=EMBED_COLOR
-    )
-    embed.set_footer(text="ECLIPSE – Routenwache-Log • wer wann eingetragen war")
+    embed = discord.Embed(title=f"📋 {route['name']} – Log ({datum})", description=beschreibung, color=EMBED_COLOR)
+    embed.set_footer(text=f"ECLIPSE – {route['name']} • wer wann eingetragen war")
     embed.timestamp = datetime.now(TIMEZONE)
     return embed
 
-async def poste_tages_log(guild: discord.Guild, datum: str):
-    """Postet den Log-Eintrag für `datum` als NEUE Nachricht in den
-    Log-Channel (kein Editieren – jeder Tag bekommt seinen eigenen Post,
-    sodass eine durchsuchbare Historie entsteht)."""
-    if not data.get("channel_stempel_liste"):
+async def poste_tages_log(route_id: str, guild: discord.Guild, datum: str):
+    route = data.get("routen", {}).get(route_id)
+    if not route or not route.get("channel_log"):
         return
-    kanal = guild.get_channel(int(data["channel_stempel_liste"]))
+    kanal = guild.get_channel(int(route["channel_log"]))
     if not kanal:
         return
-    embed = build_tages_log_embed(datum, guild)
-    await kanal.send(embed=embed)
+    await kanal.send(embed=build_tages_log_embed(route_id, datum, guild))
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# 📊  GESAMTÜBERSICHT / LEADERBOARD (nur abgeschlossene Tage, 1x täglich)
+# 📊  GESAMTÜBERSICHT / LEADERBOARD (pro Route, nur abgeschlossene Tage)
 # ════════════════════════════════════════════════════════════════════════════
 
-def build_gesamtuebersicht_embed(guild: discord.Guild) -> discord.Embed:
-    """Baut das Ranking 'wer hat insgesamt wie viele Stunden Routenwache
-    gemacht' – wird sowohl vom /wache_gesamtuebersicht-Befehl als auch
-    für den Leaderboard-Channel verwendet.
+def build_gesamtuebersicht_embed(route_id: str, guild: discord.Guild) -> discord.Embed:
+    route = data["routen"][route_id]
+    zaehler = gesamt_zeit_pro_user(route_id)
 
-    Zeigt ALLE Mitglieder mit der Routenwache-Rolle (ROUTENWACHE_ROLLE_ID),
-    auch wenn sie noch 0 Stunden haben – nicht nur die, die schon mal
-    eingetragen waren. Wer 0 Stunden hat oder im Vergleich zu den anderen
-    Rollenmitgliedern relativ wenig (unter der Hälfte des Durchschnitts),
-    wird markiert, damit auf einen Blick sichtbar ist, wer noch dran
-    (bald) sollte."""
-    zaehler = gesamt_zeit_pro_user()
-
-    rolle = guild.get_role(ROUTENWACHE_ROLLE_ID) if guild else None
-    mitglieder = rolle.members if rolle else []
-
-    if not rolle:
-        beschreibung = "Die Routenwache-Rolle wurde auf dem Server nicht gefunden."
-    elif not mitglieder:
-        beschreibung = "Niemand hat aktuell die Routenwache-Rolle."
+    if not zaehler:
+        beschreibung = "*Noch keine abgeschlossenen Wachen erfasst.*"
     else:
-        eintraege = {str(m.id): zaehler.get(str(m.id), 0) for m in mitglieder}
-        durchschnitt = sum(eintraege.values()) / len(eintraege)
-        schwelle = durchschnitt / 2  # unter der Hälfte des Durchschnitts = "bald dran"
-
-        sortiert = sorted(eintraege.items(), key=lambda x: x[1], reverse=True)
+        sortiert = sorted(zaehler.items(), key=lambda x: x[1], reverse=True)
         zeilen = []
         for i, (uid, stunden) in enumerate(sortiert, start=1):
-            member = guild.get_member(int(uid))
+            member = guild.get_member(int(uid)) if guild else None
             name = member.mention if member else f"Unbekanntes Mitglied ({uid})"
-
-            if stunden == 0:
-                marker = "   ⚠️"
-            elif stunden < schwelle:
-                marker = "   ℹ️"
-            else:
-                marker = ""
-
-            zeilen.append(f"**{i}.** {name} — **{stunden}h**{marker}")
-
-        # Discord-Embed-Description ist auf 4096 Zeichen begrenzt
+            stunden_text = f"{stunden:.1f}".rstrip("0").rstrip(".")
+            zeilen.append(f"**{i}.** {name} — **{stunden_text}h**")
         beschreibung = "\n".join(zeilen)
         if len(beschreibung) > 4000:
             beschreibung = beschreibung[:4000] + "\n… (gekürzt)"
 
-    embed = discord.Embed(
-        title="📊 Gesamtübersicht Routenwache",
-        description=beschreibung,
-        color=EMBED_COLOR
-    )
-    embed.set_footer(text="ECLIPSE – Routenwache • Summe aller abgeschlossenen Tage • ⚠️ → keine Wache durchgeführt, ℹ️ → unter Durchschnitt • täglich 00:01 Uhr aktualisiert")
+    embed = discord.Embed(title=f"📊 Gesamtübersicht – {route['name']}", description=beschreibung, color=EMBED_COLOR)
+    embed.set_footer(text="ECLIPSE – Summe aller abgeschlossenen Tage • täglich 00:01 Uhr aktualisiert")
     embed.timestamp = datetime.now(TIMEZONE)
     return embed
 
-async def refresh_gesamtuebersicht(guild: discord.Guild):
-    """Editiert (oder postet erstmalig) die EINE Leaderboard-Nachricht im
-    dafür gesetzten Channel. Wird bewusst NUR bei der täglichen
-    00:01-Routine (und beim Bot-Start / Channel-Setup) aufgerufen – NICHT
-    bei jedem Ein-/Austragen, da die Stunden erst zählen, wenn ein Tag
-    abgeschlossen ist (siehe gesamt_zeit_pro_user)."""
-    if not data.get("channel_gesamtuebersicht"):
+async def refresh_gesamtuebersicht(route_id: str, guild: discord.Guild):
+    route = data.get("routen", {}).get(route_id)
+    if not route or not route.get("channel_leaderboard"):
         return
-    kanal = guild.get_channel(int(data["channel_gesamtuebersicht"]))
+    kanal = guild.get_channel(int(route["channel_leaderboard"]))
     if not kanal:
         return
 
-    embed = build_gesamtuebersicht_embed(guild)
-
-    msg_id = data.get("gesamtuebersicht_nachricht_id")
+    embed = build_gesamtuebersicht_embed(route_id, guild)
+    msg_id = route.get("leaderboard_nachricht_id")
     if msg_id:
         try:
             msg = await kanal.fetch_message(int(msg_id))
             await msg.edit(embed=embed)
             return
         except Exception as e:
-            print(f"Alte Gesamtübersicht-Nachricht nicht gefunden, poste neu: {e}")
+            print(f"Alte Leaderboard-Nachricht ({route_id}) nicht gefunden, poste neu: {e}")
 
     msg = await kanal.send(embed=embed)
-    data["gesamtuebersicht_nachricht_id"] = str(msg.id)
+    route["leaderboard_nachricht_id"] = str(msg.id)
     save_data(data)
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# 🎛️  SLASH-COMMANDS
+# 🎛️  SLASH-COMMANDS — ROUTEN-VERWALTUNG (nur Leitung/Admin)
 # ════════════════════════════════════════════════════════════════════════════
-# Admin/Leitung: /wache_channel_setzen, /wache_liste_channel_setzen,
-# /set_leaderboard, /wache_posten, /wache_nachtragen, /channels.
-# Für ALLE offen: /wache_eintragen, /wache_austragen, /meine_wache,
-# /wache_gesamtuebersicht.
 
-WACHE_CHOICES = [app_commands.Choice(name=slot_label(s), value=s) for s in SLOTS]
-
-
-@tree.command(name="wache_channel_setzen", description="Setzt den Channel für die Routenwache-Buttons")
-@app_commands.describe(channel="Der Channel wo die Zeitraum-Buttons gepostet werden")
-@app_commands.check(ist_admin_oder_leitung)
-async def wache_channel_setzen(interaction: discord.Interaction, channel: discord.TextChannel):
-    data["channel_stempel"] = channel.id
-    data["stempel_nachricht_id"] = None
-    save_data(data)
-    await interaction.response.send_message(f"✅ Routenwache-Channel gesetzt: {channel.mention}", ephemeral=True)
-    await refresh_wache_nachricht(interaction.guild)
-
-
-@tree.command(name="wache_liste_channel_setzen", description="Setzt den Channel für das tägliche Routenwache-Log (Post um 00:01 Uhr)")
-@app_commands.describe(channel="Der Channel wo täglich um 00:01 Uhr der Log-Post landet")
-@app_commands.check(ist_admin_oder_leitung)
-async def wache_liste_channel_setzen(interaction: discord.Interaction, channel: discord.TextChannel):
-    data["channel_stempel_liste"] = channel.id
-    save_data(data)
-    await interaction.response.send_message(
-        f"✅ Routenwache-Log-Channel gesetzt: {channel.mention}\n"
-        f"Dort erscheint ab jetzt jeden Tag um 00:01 Uhr automatisch ein neuer Log-Post mit den Daten des Vortages.",
-        ephemeral=True
-    )
-
-
-@tree.command(name="set_leaderboard", description="Setzt den Channel für die Gesamtübersicht (täglich um 00:01 Uhr aktualisiert)")
-@app_commands.describe(channel="Der Channel, in dem das Leaderboard täglich um 00:01 Uhr aktualisiert wird")
-@app_commands.check(ist_admin_oder_leitung)
-async def set_leaderboard(interaction: discord.Interaction, channel: discord.TextChannel):
-    data["channel_gesamtuebersicht"] = channel.id
-    data["gesamtuebersicht_nachricht_id"] = None
-    save_data(data)
-    await interaction.response.send_message(
-        f"✅ Leaderboard-Channel gesetzt: {channel.mention}\n"
-        f"Dort erscheint jetzt eine Nachricht mit dem Ranking, die täglich um 00:01 Uhr aktualisiert wird "
-        f"(zählt nur bereits abgeschlossene Tage, der heutige Tag läuft ja noch).",
-        ephemeral=True
-    )
-    await refresh_gesamtuebersicht(interaction.guild)
-
-
-@tree.command(name="wache_posten", description="Postet oder aktualisiert die Routenwache-Nachricht (Zeitraum-Buttons)")
-@app_commands.check(ist_admin_oder_leitung)
-async def wache_posten(interaction: discord.Interaction):
-    await interaction.response.defer(ephemeral=True)
-    await refresh_wache_nachricht(interaction.guild)
-    await interaction.followup.send("✅ Routenwache-Nachricht gepostet/aktualisiert.", ephemeral=True)
-
-
-@tree.command(name="wache_eintragen", description="Trägt ein Mitglied manuell in einen heutigen Zeitraum ein")
-@app_commands.describe(mitglied="Das Mitglied", zeitraum="Der Zeitraum")
-@app_commands.choices(zeitraum=WACHE_CHOICES)
-async def wache_eintragen(interaction: discord.Interaction, mitglied: discord.Member, zeitraum: app_commands.Choice[str]):
-    today = heute_key()
-    eintrag = get_tag_eintrag(today)
-    uid = str(mitglied.id)
-    slot = zeitraum.value
-    liste = eintrag.setdefault(slot, [])
-
-    if uid in liste:
-        await interaction.response.send_message(
-            f"❌ {mitglied.mention} ist bereits für **{slot_label(slot)}** eingetragen.",
-            ephemeral=True
-        )
-        return
-
-    if len(liste) >= MAX_PLAETZE_PRO_SLOT:
-        await interaction.response.send_message(f"❌ **{slot_label(slot)}** ist bereits voll.", ephemeral=True)
-        return
-
-    liste.append(uid)
-    save_data(data)
-
-    await interaction.response.send_message(f"✅ {mitglied.mention} wurde für **{slot_label(slot)}** eingetragen.", ephemeral=True)
-    await refresh_wache_nachricht(interaction.guild)
-
-
-@tree.command(name="wache_nachtragen", description="Trägt ein Mitglied nachträglich für einen VERGANGENEN Tag/Zeitraum ein")
+@tree.command(name="route_erstellen", description="Erstellt eine neue Route (z.B. 'SGF Kurzwaffen Route')")
 @app_commands.describe(
-    mitglied="Das Mitglied",
-    datum="Datum im Format TT.MM.JJJJ (z.B. 27.07.2026)",
-    zeitraum="Der Zeitraum"
+    name="Name der Route",
+    kapazitaet="Max. Personen pro Zeitraum",
+    standard_zeitraeume="Die Morteco-Zeiträume (18-19:30, 19:30-21, 21-22:30, 22:30-00 Uhr) automatisch übernehmen? Standard: Ja"
 )
-@app_commands.choices(zeitraum=WACHE_CHOICES)
 @app_commands.check(ist_admin_oder_leitung)
-async def wache_nachtragen(interaction: discord.Interaction, mitglied: discord.Member, datum: str, zeitraum: app_commands.Choice[str]):
+async def route_erstellen(interaction: discord.Interaction, name: str, kapazitaet: int, standard_zeitraeume: bool = True):
+    if kapazitaet < 1:
+        await interaction.response.send_message("❌ Kapazität muss mindestens 1 sein.", ephemeral=True)
+        return
+    route_id = erstelle_route_id(name)
+    data.setdefault("routen", {})[route_id] = {
+        "name": name,
+        "kapazitaet": kapazitaet,
+        "slots": list(STANDARD_SLOTS) if standard_zeitraeume else [],
+        "channel_buttons": None,
+        "stempel_nachricht_id": None,
+        "channel_log": None,
+        "channel_leaderboard": None,
+        "leaderboard_nachricht_id": None,
+        "ping_rolle_id": None,
+        "gesperrte_tage": {},
+    }
+    save_data(data)
+    zeitraeume_text = (
+        "\nÜbernommene Zeiträume: " + ", ".join(slot_label(s) for s in STANDARD_SLOTS)
+        if standard_zeitraeume else
+        "\nNoch keine Zeiträume – füge sie mit `/route_slot_hinzufuegen` hinzu."
+    )
+    await interaction.response.send_message(
+        f"✅ Route **{name}** erstellt (ID: `{route_id}`).{zeitraeume_text}\n"
+        f"Als Nächstes: `/route_channel_buttons_setzen` usw.",
+        ephemeral=True
+    )
+
+@tree.command(name="route_loeschen", description="Löscht eine Route komplett (inkl. aller erfassten Zeiten)")
+@app_commands.describe(route="Die zu löschende Route")
+@app_commands.autocomplete(route=route_autocomplete)
+@app_commands.check(ist_admin_oder_leitung)
+async def route_loeschen(interaction: discord.Interaction, route: str):
+    info = data.get("routen", {}).get(route)
+    if not info:
+        await interaction.response.send_message("❌ Route nicht gefunden.", ephemeral=True)
+        return
+
+    if info.get("channel_buttons") and info.get("stempel_nachricht_id"):
+        try:
+            kanal = interaction.guild.get_channel(int(info["channel_buttons"]))
+            if kanal:
+                msg = await kanal.fetch_message(int(info["stempel_nachricht_id"]))
+                await msg.delete()
+        except Exception:
+            pass
+
+    name = info["name"]
+    del data["routen"][route]
+    data.get("tage", {}).pop(route, None)
+    wache_views.pop(route, None)
+    save_data(data)
+    await interaction.response.send_message(f"🗑️ Route **{name}** (`{route}`) und alle zugehörigen Daten wurden gelöscht.", ephemeral=True)
+
+@tree.command(name="route_slot_hinzufuegen", description="Fügt einer Route einen Zeitraum hinzu (z.B. 18:00 bis 19:30)")
+@app_commands.describe(route="Die Route", start="Startzeit HH:MM, z.B. 18:00", ende="Endzeit HH:MM, z.B. 19:30")
+@app_commands.autocomplete(route=route_autocomplete)
+@app_commands.check(ist_admin_oder_leitung)
+async def route_slot_hinzufuegen(interaction: discord.Interaction, route: str, start: str, ende: str):
+    if route not in data.get("routen", {}):
+        await interaction.response.send_message("❌ Route nicht gefunden.", ephemeral=True)
+        return
+    start, ende = start.strip(), ende.strip()
+    if not ZEIT_REGEX.match(start) or not ZEIT_REGEX.match(ende):
+        await interaction.response.send_message("❌ Ungültiges Zeitformat. Bitte HH:MM verwenden, z.B. `18:00`.", ephemeral=True)
+        return
+
+    slot = f"{start}-{ende}"
+    slots = data["routen"][route]["slots"]
+    if slot in slots:
+        await interaction.response.send_message(f"❌ Zeitraum **{slot_label(slot)}** existiert bereits.", ephemeral=True)
+        return
+
+    slots.append(slot)
+    save_data(data)
+    await interaction.response.send_message(f"✅ Zeitraum **{slot_label(slot)}** zur Route hinzugefügt.", ephemeral=True)
+    await refresh_wache_nachricht(route, interaction.guild)
+
+@tree.command(name="route_slot_entfernen", description="Entfernt einen Zeitraum von einer Route")
+@app_commands.describe(route="Die Route", zeitraum="Der zu entfernende Zeitraum")
+@app_commands.autocomplete(route=route_autocomplete, zeitraum=zeitraum_autocomplete)
+@app_commands.check(ist_admin_oder_leitung)
+async def route_slot_entfernen(interaction: discord.Interaction, route: str, zeitraum: str):
+    slots = data.get("routen", {}).get(route, {}).get("slots", [])
+    if zeitraum not in slots:
+        await interaction.response.send_message("❌ Dieser Zeitraum existiert bei dieser Route nicht.", ephemeral=True)
+        return
+    slots.remove(zeitraum)
+    save_data(data)
+    await interaction.response.send_message(f"✅ Zeitraum **{slot_label(zeitraum)}** entfernt.", ephemeral=True)
+    await refresh_wache_nachricht(route, interaction.guild)
+
+@tree.command(name="route_kapazitaet_setzen", description="Setzt die maximale Personenzahl pro Zeitraum einer Route")
+@app_commands.describe(route="Die Route", kapazitaet="Neue max. Personenzahl pro Zeitraum")
+@app_commands.autocomplete(route=route_autocomplete)
+@app_commands.check(ist_admin_oder_leitung)
+async def route_kapazitaet_setzen(interaction: discord.Interaction, route: str, kapazitaet: int):
+    if route not in data.get("routen", {}):
+        await interaction.response.send_message("❌ Route nicht gefunden.", ephemeral=True)
+        return
+    if kapazitaet < 1:
+        await interaction.response.send_message("❌ Kapazität muss mindestens 1 sein.", ephemeral=True)
+        return
+    data["routen"][route]["kapazitaet"] = kapazitaet
+    save_data(data)
+    await interaction.response.send_message(f"✅ Kapazität auf **{kapazitaet}** pro Zeitraum gesetzt.", ephemeral=True)
+    await refresh_wache_nachricht(route, interaction.guild)
+
+@tree.command(name="route_tag_sperren", description="Sperrt einen (oder mehrere) Tag(e) für eine Route komplett, z.B. wenn keine Zeit ist")
+@app_commands.describe(
+    route="Die Route",
+    datum="Datum TT.MM.JJJJ (Standard: heute)",
+    bis="Optional: Enddatum TT.MM.JJJJ, um einen Zeitraum zu sperren",
+    grund="Optional: Grund, z.B. 'keine Zeit' (wird in der Nachricht angezeigt)"
+)
+@app_commands.autocomplete(route=route_autocomplete)
+@app_commands.check(ist_admin_oder_leitung)
+async def route_tag_sperren(interaction: discord.Interaction, route: str, datum: str = None, bis: str = None, grund: str = None):
+    if route not in data.get("routen", {}):
+        await interaction.response.send_message("❌ Route nicht gefunden.", ephemeral=True)
+        return
     try:
-        tag = parse_datum(datum)
+        start_tag = parse_datum(datum) if datum else heute_key()
+        tage_liste = datum_bereich(start_tag, parse_datum(bis)) if bis else [start_tag]
     except ValueError:
-        await interaction.response.send_message(
-            "❌ Ungültiges Datum. Bitte im Format **TT.MM.JJJJ** angeben (z.B. `27.07.2026`).", ephemeral=True
-        )
+        await interaction.response.send_message("❌ Ungültiges Datum. Format: **TT.MM.JJJJ**, z.B. `27.07.2026`.", ephemeral=True)
         return
 
-    eintrag = get_tag_eintrag(tag)
-    uid = str(mitglied.id)
-    slot = zeitraum.value
-    liste = eintrag.setdefault(slot, [])
+    routeninfo = data["routen"][route]
+    gesperrte_tage = routeninfo.setdefault("gesperrte_tage", {})
+    entfernte_eintraege = 0
+    for tag in tage_liste:
+        gesperrte_tage[tag] = grund
+        eintrag = data.get("tage", {}).get(route, {}).get(tag, {})
+        for slot, liste in eintrag.items():
+            entfernte_eintraege += len(liste)
+            liste.clear()
+    save_data(data)
+
+    grund_text = f" Grund: {grund}" if grund else ""
+    tage_text = f"**{tage_liste[0]}**" if len(tage_liste) == 1 else f"**{tage_liste[0]}** bis **{tage_liste[-1]}** ({len(tage_liste)} Tage)"
+    zusatz = f"\n{entfernte_eintraege} bestehende Einträge wurden dabei entfernt." if entfernte_eintraege else ""
+    await interaction.response.send_message(f"🚫 **{routeninfo['name']}** ist an {tage_text} gesperrt.{grund_text}{zusatz}", ephemeral=True)
+
+    if heute_key() in tage_liste:
+        await refresh_wache_nachricht(route, interaction.guild)
+
+@tree.command(name="route_tag_entsperren", description="Hebt die Sperre für einen (oder mehrere) Tag(e) einer Route wieder auf")
+@app_commands.describe(
+    route="Die Route",
+    datum="Datum TT.MM.JJJJ (Standard: heute)",
+    bis="Optional: Enddatum TT.MM.JJJJ, um einen Zeitraum zu entsperren"
+)
+@app_commands.autocomplete(route=route_autocomplete)
+@app_commands.check(ist_admin_oder_leitung)
+async def route_tag_entsperren(interaction: discord.Interaction, route: str, datum: str = None, bis: str = None):
+    if route not in data.get("routen", {}):
+        await interaction.response.send_message("❌ Route nicht gefunden.", ephemeral=True)
+        return
+    try:
+        start_tag = parse_datum(datum) if datum else heute_key()
+        tage_liste = datum_bereich(start_tag, parse_datum(bis)) if bis else [start_tag]
+    except ValueError:
+        await interaction.response.send_message("❌ Ungültiges Datum. Format: **TT.MM.JJJJ**, z.B. `27.07.2026`.", ephemeral=True)
+        return
+
+    routeninfo = data["routen"][route]
+    gesperrte_tage = routeninfo.setdefault("gesperrte_tage", {})
+    entsperrt = 0
+    for tag in tage_liste:
+        if tag in gesperrte_tage:
+            del gesperrte_tage[tag]
+            entsperrt += 1
+    save_data(data)
+
+    if entsperrt == 0:
+        await interaction.response.send_message("❌ Für diesen Zeitraum war keine Sperre aktiv.", ephemeral=True)
+        return
+
+    tage_text = f"**{tage_liste[0]}**" if len(tage_liste) == 1 else f"**{tage_liste[0]}** bis **{tage_liste[-1]}**"
+    await interaction.response.send_message(f"✅ Sperre für **{routeninfo['name']}** an {tage_text} aufgehoben ({entsperrt} Tag(e)).", ephemeral=True)
+
+    if heute_key() in tage_liste:
+        await refresh_wache_nachricht(route, interaction.guild)
+
+@tree.command(name="route_channel_buttons_setzen", description="Setzt den Channel für die Ein-/Austragen-Buttons einer Route")
+@app_commands.autocomplete(route=route_autocomplete)
+@app_commands.check(ist_admin_oder_leitung)
+async def route_channel_buttons_setzen(interaction: discord.Interaction, route: str, channel: discord.TextChannel):
+    if route not in data.get("routen", {}):
+        await interaction.response.send_message("❌ Route nicht gefunden.", ephemeral=True)
+        return
+    data["routen"][route]["channel_buttons"] = channel.id
+    data["routen"][route]["stempel_nachricht_id"] = None
+    save_data(data)
+    await interaction.response.send_message(f"✅ Buttons-Channel gesetzt: {channel.mention}", ephemeral=True)
+    await refresh_wache_nachricht(route, interaction.guild)
+
+@tree.command(name="route_channel_log_setzen", description="Setzt den Channel für das tägliche Log (00:01 Uhr) einer Route")
+@app_commands.autocomplete(route=route_autocomplete)
+@app_commands.check(ist_admin_oder_leitung)
+async def route_channel_log_setzen(interaction: discord.Interaction, route: str, channel: discord.TextChannel):
+    if route not in data.get("routen", {}):
+        await interaction.response.send_message("❌ Route nicht gefunden.", ephemeral=True)
+        return
+    data["routen"][route]["channel_log"] = channel.id
+    save_data(data)
+    await interaction.response.send_message(f"✅ Log-Channel gesetzt: {channel.mention}", ephemeral=True)
+
+@tree.command(name="route_channel_leaderboard_setzen", description="Setzt den Channel für die Gesamtübersicht einer Route")
+@app_commands.autocomplete(route=route_autocomplete)
+@app_commands.check(ist_admin_oder_leitung)
+async def route_channel_leaderboard_setzen(interaction: discord.Interaction, route: str, channel: discord.TextChannel):
+    if route not in data.get("routen", {}):
+        await interaction.response.send_message("❌ Route nicht gefunden.", ephemeral=True)
+        return
+    data["routen"][route]["channel_leaderboard"] = channel.id
+    data["routen"][route]["leaderboard_nachricht_id"] = None
+    save_data(data)
+    await interaction.response.send_message(f"✅ Leaderboard-Channel gesetzt: {channel.mention}", ephemeral=True)
+    await refresh_gesamtuebersicht(route, interaction.guild)
+
+@tree.command(name="route_ping_rolle_setzen", description="Setzt eine Rolle, die beim Tageswechsel geist-gepingt wird (optional)")
+@app_commands.autocomplete(route=route_autocomplete)
+@app_commands.check(ist_admin_oder_leitung)
+async def route_ping_rolle_setzen(interaction: discord.Interaction, route: str, rolle: discord.Role):
+    if route not in data.get("routen", {}):
+        await interaction.response.send_message("❌ Route nicht gefunden.", ephemeral=True)
+        return
+    data["routen"][route]["ping_rolle_id"] = rolle.id
+    save_data(data)
+    await interaction.response.send_message(f"✅ Ping-Rolle gesetzt: {rolle.mention}", ephemeral=True)
+
+@tree.command(name="route_ping_rolle_entfernen", description="Entfernt die Geist-Ping-Rolle einer Route wieder")
+@app_commands.autocomplete(route=route_autocomplete)
+@app_commands.check(ist_admin_oder_leitung)
+async def route_ping_rolle_entfernen(interaction: discord.Interaction, route: str):
+    if route not in data.get("routen", {}):
+        await interaction.response.send_message("❌ Route nicht gefunden.", ephemeral=True)
+        return
+    data["routen"][route]["ping_rolle_id"] = None
+    save_data(data)
+    await interaction.response.send_message("✅ Ping-Rolle entfernt.", ephemeral=True)
+
+@tree.command(name="route_posten", description="Postet/aktualisiert die Buttons-Nachricht einer Route")
+@app_commands.autocomplete(route=route_autocomplete)
+@app_commands.check(ist_admin_oder_leitung)
+async def route_posten(interaction: discord.Interaction, route: str):
+    if route not in data.get("routen", {}):
+        await interaction.response.send_message("❌ Route nicht gefunden.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    await refresh_wache_nachricht(route, interaction.guild)
+    await interaction.followup.send("✅ Buttons-Nachricht gepostet/aktualisiert.", ephemeral=True)
+
+@tree.command(name="routen_liste", description="Zeigt alle konfigurierten Routen mit ihren Einstellungen")
+@app_commands.check(ist_admin_oder_leitung)
+async def routen_liste(interaction: discord.Interaction):
+    routen = data.get("routen", {})
+    if not routen:
+        await interaction.response.send_message("Es sind noch keine Routen konfiguriert. Nutze `/route_erstellen`.", ephemeral=True)
+        return
+
+    embed = discord.Embed(title="🗺️ Konfigurierte Routen", color=EMBED_COLOR)
+    for rid, info in routen.items():
+        slots_text = ", ".join(slot_label(s) for s in sorted(info["slots"], key=slot_sortier_schluessel)) or "*keine Zeiträume*"
+        btn_ch = f"<#{info['channel_buttons']}>" if info.get("channel_buttons") else "❌"
+        log_ch = f"<#{info['channel_log']}>" if info.get("channel_log") else "❌"
+        lb_ch = f"<#{info['channel_leaderboard']}>" if info.get("channel_leaderboard") else "❌"
+        gesperrte_tage = info.get("gesperrte_tage", {})
+        sperr_text = f"\nGesperrte Tage: {', '.join(sorted(gesperrte_tage.keys()))}" if gesperrte_tage else ""
+        embed.add_field(
+            name=f"{info['name']} (`{rid}`)",
+            value=f"Kapazität: **{info['kapazitaet']}**/Zeitraum\nZeiträume: {slots_text}\nButtons: {btn_ch} • Log: {log_ch} • Leaderboard: {lb_ch}{sperr_text}",
+            inline=False
+        )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# 🎛️  SLASH-COMMANDS — EIN-/AUSTRAGEN (offen für ALLE)
+# ════════════════════════════════════════════════════════════════════════════
+
+@tree.command(name="wache_eintragen", description="Trägt dich (oder ein Mitglied) für einen Zeitraum einer Route ein")
+@app_commands.describe(
+    route="Die Route", zeitraum="Der Zeitraum",
+    mitglied="Optional: anderes Mitglied eintragen (Standard: du selbst)",
+    datum="Optional: Datum TT.MM.JJJJ, z.B. für zukünftige Tage (Standard: heute)"
+)
+@app_commands.autocomplete(route=route_autocomplete, zeitraum=zeitraum_autocomplete)
+async def wache_eintragen(interaction: discord.Interaction, route: str, zeitraum: str, mitglied: discord.Member = None, datum: str = None):
+    routeninfo = data.get("routen", {}).get(route)
+    if not routeninfo:
+        await interaction.response.send_message("❌ Route nicht gefunden.", ephemeral=True)
+        return
+    if zeitraum not in routeninfo["slots"]:
+        await interaction.response.send_message("❌ Dieser Zeitraum existiert bei dieser Route nicht (mehr).", ephemeral=True)
+        return
+
+    ziel = mitglied or interaction.user
+    uid = str(ziel.id)
+    if uid in data.get("gesperrte_user", []):
+        await interaction.response.send_message(f"❌ {ziel.mention} hat aktuell eine Routensperre.", ephemeral=True)
+        return
+
+    if datum:
+        try:
+            tag = parse_datum(datum)
+        except ValueError:
+            await interaction.response.send_message("❌ Ungültiges Datum. Format: **TT.MM.JJJJ**, z.B. `27.07.2026`.", ephemeral=True)
+            return
+    else:
+        tag = heute_key()
+
+    if ist_tag_gesperrt(route, tag):
+        grund = tag_sperrgrund(route, tag)
+        grund_text = f" Grund: {grund}" if grund else ""
+        await interaction.response.send_message(f"❌ **{tag}** ist für diese Route komplett gesperrt.{grund_text}", ephemeral=True)
+        return
+
+    eintrag = get_tag_eintrag(route, tag)
+    liste = eintrag.setdefault(zeitraum, [])
 
     if uid in liste:
-        await interaction.response.send_message(
-            f"❌ {mitglied.mention} ist für **{tag} — {slot_label(slot)}** bereits eingetragen.", ephemeral=True
-        )
+        await interaction.response.send_message(f"❌ {ziel.mention} ist am **{tag}** bereits für **{slot_label(zeitraum)}** eingetragen.", ephemeral=True)
         return
-
-    if len(liste) >= MAX_PLAETZE_PRO_SLOT:
-        await interaction.response.send_message(
-            f"❌ **{tag} — {slot_label(slot)}** ist bereits voll ({MAX_PLAETZE_PRO_SLOT}/{MAX_PLAETZE_PRO_SLOT}).", ephemeral=True
-        )
+    if len(liste) >= routeninfo["kapazitaet"]:
+        await interaction.response.send_message(f"❌ **{tag} — {slot_label(zeitraum)}** ist bereits voll ({routeninfo['kapazitaet']}/{routeninfo['kapazitaet']}).", ephemeral=True)
+        return
+    aktuelle = alle_slots_von_user(eintrag, uid)
+    if len(aktuelle) >= MAX_ZEITRAEUME_PRO_USER:
+        await interaction.response.send_message(f"❌ {ziel.mention} ist am **{tag}** bereits in {MAX_ZEITRAEUME_PRO_USER} Zeiträumen dieser Route eingetragen.", ephemeral=True)
         return
 
     liste.append(uid)
     save_data(data)
+    await interaction.response.send_message(f"✅ {ziel.mention} wurde für **{tag} — {slot_label(zeitraum)}** ({routeninfo['name']}) eingetragen.", ephemeral=True)
 
-    await interaction.response.send_message(
-        f"✅ {mitglied.mention} wurde nachträglich für **{tag} — {slot_label(slot)}** eingetragen.", ephemeral=True
-    )
-
-    # Wenn es sich um den heutigen Tag handelt, auch die Live-Buttons-Nachricht aktualisieren.
-    # Die Gesamtübersicht wird bewusst NICHT sofort aktualisiert – sie zählt
-    # erst wieder bei der täglichen 00:01-Routine (nur abgeschlossene Tage).
     if tag == heute_key():
-        await refresh_wache_nachricht(interaction.guild)
+        await refresh_wache_nachricht(route, interaction.guild)
 
-
-@tree.command(name="wache_austragen", description="Trägt dich (oder ein anderes Mitglied) aus einem oder allen Zeiträumen aus")
+@tree.command(name="wache_austragen", description="Trägt dich (oder ein Mitglied) aus einem oder allen Zeiträumen einer Route aus")
 @app_commands.describe(
+    route="Die Route",
     mitglied="Optional: anderes Mitglied austragen (Standard: du selbst)",
-    zeitraum="Optional: nur aus diesem Zeitraum austragen (Standard: aus allen Zeiträumen des Tages)",
-    datum="Optional: Datum im Format TT.MM.JJJJ, um einen vergangenen Tag zu korrigieren (Standard: heute)"
+    zeitraum="Optional: nur aus diesem Zeitraum austragen (Standard: alle Zeiträume dieses Tages)",
+    datum="Optional: Datum TT.MM.JJJJ, z.B. für einen zukünftigen/vergangenen Tag (Standard: heute)"
 )
-@app_commands.choices(zeitraum=WACHE_CHOICES)
-async def wache_austragen(interaction: discord.Interaction, mitglied: discord.Member = None, zeitraum: app_commands.Choice[str] = None, datum: str = None):
+@app_commands.autocomplete(route=route_autocomplete, zeitraum=zeitraum_autocomplete)
+async def wache_austragen(interaction: discord.Interaction, route: str, mitglied: discord.Member = None, zeitraum: str = None, datum: str = None):
+    if route not in data.get("routen", {}):
+        await interaction.response.send_message("❌ Route nicht gefunden.", ephemeral=True)
+        return
     ziel = mitglied or interaction.user
 
     if datum:
         try:
             tag = parse_datum(datum)
         except ValueError:
-            await interaction.response.send_message(
-                "❌ Ungültiges Datum. Bitte im Format **TT.MM.JJJJ** angeben (z.B. `27.07.2026`).", ephemeral=True
-            )
+            await interaction.response.send_message("❌ Ungültiges Datum. Format: **TT.MM.JJJJ**, z.B. `27.07.2026`.", ephemeral=True)
             return
     else:
         tag = heute_key()
 
-    eintrag = get_tag_eintrag(tag)
+    eintrag = get_tag_eintrag(route, tag)
     uid = str(ziel.id)
 
     if zeitraum:
-        zu_entfernen = [zeitraum.value] if uid in eintrag.get(zeitraum.value, []) else []
+        zu_entfernen = [zeitraum] if uid in eintrag.get(zeitraum, []) else []
     else:
         zu_entfernen = alle_slots_von_user(eintrag, uid)
 
     if not zu_entfernen:
-        bezug = f"für **{slot_label(zeitraum.value)}**" if zeitraum else "für keinen Zeitraum"
-        await interaction.response.send_message(f"❌ {ziel.mention} ist am **{tag}** nicht {bezug} eingetragen.", ephemeral=True)
+        bezug = f"für **{slot_label(zeitraum)}**" if zeitraum else "für keinen Zeitraum"
+        await interaction.response.send_message(f"❌ {ziel.mention} ist am **{tag}** {bezug} eingetragen.", ephemeral=True)
         return
 
     for slot in zu_entfernen:
@@ -623,45 +896,83 @@ async def wache_austragen(interaction: discord.Interaction, mitglied: discord.Me
     await interaction.response.send_message(f"✅ {ziel.mention} wurde am **{tag}** aus {zeitraeume_text} ausgetragen.", ephemeral=True)
 
     if tag == heute_key():
-        await refresh_wache_nachricht(interaction.guild)
+        await refresh_wache_nachricht(route, interaction.guild)
 
-
-@tree.command(name="meine_wache", description="Zeigt deinen heutigen Routenwache-Status")
-async def meine_wache(interaction: discord.Interaction):
+@tree.command(name="meine_wache", description="Zeigt deinen heutigen Routenwache-Status (alle Routen oder eine bestimmte)")
+@app_commands.describe(route="Optional: nur eine bestimmte Route anzeigen")
+@app_commands.autocomplete(route=route_autocomplete)
+async def meine_wache(interaction: discord.Interaction, route: str = None):
     today = heute_key()
-    eintrag = get_tag_eintrag(today)
     uid = str(interaction.user.id)
-    slots = alle_slots_von_user(eintrag, uid)
+    routen = {route: data["routen"][route]} if route and route in data.get("routen", {}) else data.get("routen", {})
 
-    if slots:
-        text = "\n".join(f"🟢 **{slot_label(s)}**" for s in slots)
-    else:
-        text = "🔴 Du bist heute für keinen Zeitraum eingetragen."
+    zeilen = []
+    for rid, info in routen.items():
+        eintrag = get_tag_eintrag(rid, today)
+        slots = alle_slots_von_user(eintrag, uid)
+        for slot in slots:
+            zeilen.append(f"🟢 **{info['name']}** — {slot_label(slot)}")
 
-    await interaction.response.send_message(f"**Deine Routenwache ({today})**\n{text}", ephemeral=True)
+    text = "\n".join(zeilen) if zeilen else "🔴 Du bist heute für keinen Zeitraum eingetragen."
+    gesperrt_hinweis = "\n\n🔒 Du hast aktuell eine Routensperre." if uid in data.get("gesperrte_user", []) else ""
+    await interaction.response.send_message(f"**Deine Routenwache ({today})**\n{text}{gesperrt_hinweis}", ephemeral=True)
 
-
-@tree.command(name="wache_gesamtuebersicht", description="Zeigt, wer insgesamt wie viele Stunden Routenwache gemacht hat")
-async def wache_gesamtuebersicht(interaction: discord.Interaction):
-    embed = build_gesamtuebersicht_embed(interaction.guild)
+@tree.command(name="route_gesamtuebersicht", description="Zeigt, wer bei einer Route insgesamt wie viele Stunden gemacht hat")
+@app_commands.describe(route="Die Route")
+@app_commands.autocomplete(route=route_autocomplete)
+async def route_gesamtuebersicht(interaction: discord.Interaction, route: str):
+    if route not in data.get("routen", {}):
+        await interaction.response.send_message("❌ Route nicht gefunden.", ephemeral=True)
+        return
+    embed = build_gesamtuebersicht_embed(route, interaction.guild)
     await interaction.response.send_message(embed=embed)
 
 
-@tree.command(name="channels", description="Zeigt die aktuell gesetzten Channels für die Routenwache")
+# ════════════════════════════════════════════════════════════════════════════
+# 🎛️  SLASH-COMMANDS — ROUTENSPERRE (nur Leitung/Admin)
+# ════════════════════════════════════════════════════════════════════════════
+
+@tree.command(name="routensperre_setzen", description="Verhängt eine Routensperre über ein Mitglied (kann sich nirgends mehr eintragen)")
+@app_commands.describe(mitglied="Das Mitglied", grund="Optional: Grund für die Sperre (nur zur Dokumentation)")
+@app_commands.check(ist_admin_oder_leitung)
+async def routensperre_setzen(interaction: discord.Interaction, mitglied: discord.Member, grund: str = None):
+    uid = str(mitglied.id)
+    gesperrte = data.setdefault("gesperrte_user", [])
+    if uid in gesperrte:
+        await interaction.response.send_message(f"❌ {mitglied.mention} ist bereits gesperrt.", ephemeral=True)
+        return
+
+    gesperrte.append(uid)
+    entfernte = entferne_aus_allen_zukuenftigen_eintraegen(uid)
+    save_data(data)
+
+    grund_text = f"\nGrund: {grund}" if grund else ""
+    zusatz = f"\nAutomatisch aus {len(entfernte)} bevorstehenden Einträgen ausgetragen." if entfernte else ""
+    await interaction.response.send_message(f"🔒 {mitglied.mention} wurde gesperrt.{grund_text}{zusatz}", ephemeral=True)
+
+    heute = heute_key()
+    betroffene_routen = {r for (r, d, s) in entfernte if d == heute}
+    for r in betroffene_routen:
+        await refresh_wache_nachricht(r, interaction.guild)
+
+@tree.command(name="routensperre_aufheben", description="Hebt die Routensperre eines Mitglieds wieder auf")
+@app_commands.describe(mitglied="Das Mitglied")
+@app_commands.check(ist_admin_oder_leitung)
+async def routensperre_aufheben(interaction: discord.Interaction, mitglied: discord.Member):
+    uid = str(mitglied.id)
+    gesperrte = data.setdefault("gesperrte_user", [])
+    if uid not in gesperrte:
+        await interaction.response.send_message(f"❌ {mitglied.mention} ist gar nicht gesperrt.", ephemeral=True)
+        return
+    gesperrte.remove(uid)
+    save_data(data)
+    await interaction.response.send_message(f"🔓 Routensperre von {mitglied.mention} wurde aufgehoben.", ephemeral=True)
+
+
+@tree.command(name="channels", description="Zeigt alle Routen mit ihren gesetzten Channels")
 @app_commands.check(ist_admin_oder_leitung)
 async def channels_info(interaction: discord.Interaction):
-    stempel_ch = interaction.guild.get_channel(int(data["channel_stempel"])) if data.get("channel_stempel") else None
-    stempel_liste_ch = interaction.guild.get_channel(int(data["channel_stempel_liste"])) if data.get("channel_stempel_liste") else None
-    gesamt_ch = interaction.guild.get_channel(int(data["channel_gesamtuebersicht"])) if data.get("channel_gesamtuebersicht") else None
-
-    await interaction.response.send_message(
-        f"**Aktuelle Einstellungen – Routenwache:**\n\n"
-        f"Routenwache (Buttons):  {stempel_ch.mention if stempel_ch else '❌ Nicht gesetzt – /wache_channel_setzen benutzen'}\n"
-        f"Leaderboard (täglich 00:01 Uhr, nur abgeschlossene Tage):  {gesamt_ch.mention if gesamt_ch else '❌ Nicht gesetzt – /set_leaderboard benutzen'}\n"
-        f"Routenwache-Log (täglich 00:01 Uhr):  {stempel_liste_ch.mention if stempel_liste_ch else '❌ Nicht gesetzt – /wache_liste_channel_setzen benutzen'}",
-        ephemeral=True
-    )
-
+    await routen_liste.callback(interaction)
 
 @tree.command(name="sync_status", description="Zeigt, ob GUILD_ID gesetzt ist und wie die Befehle gesynct wurden")
 @app_commands.check(ist_admin_oder_leitung)
@@ -679,37 +990,29 @@ async def sync_status(interaction: discord.Interaction):
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# 🌙  TAGESWECHSEL (automatisch täglich um 00:01 Uhr)
+# 🌙  TAGESWECHSEL (automatisch täglich um 00:01 Uhr, für ALLE Routen)
 # ════════════════════════════════════════════════════════════════════════════
 letzter_bekannter_tag = None
 
 @tasks.loop(time=dt_time(hour=0, minute=1, tzinfo=TIMEZONE))
 async def tageswechsel_check():
-    """Läuft jeden Tag exakt um 00:01 Uhr (Europe/Berlin):
-    1. Postet den Log-Eintrag für den GESTRIGEN Tag in den Log-Channel
-       (wer war wann eingetragen) – als neue Nachricht, damit im Channel
-       eine durchsuchbare Historie entsteht.
-    2. Setzt die Routenwache-Buttons-Nachricht für den neuen Tag auf.
-    3. Aktualisiert die Leaderboard-Nachricht (zählt jetzt den gestrigen
-       Tag als abgeschlossen mit).
-    4. Geist-pingt die Routenwache-Rolle EINMAL im Buttons-Channel – NUR
-       hier, weil sich hier wirklich das DATUM in der Nachricht ändert."""
     global letzter_bekannter_tag
     vorheriger_tag = letzter_bekannter_tag
     heute = heute_key()
     letzter_bekannter_tag = heute
 
     for guild in bot.guilds:
-        try:
-            if vorheriger_tag and vorheriger_tag != heute:
-                await poste_tages_log(guild, vorheriger_tag)
-            await refresh_wache_nachricht(guild)
-            await refresh_gesamtuebersicht(guild)
-            if vorheriger_tag and vorheriger_tag != heute:
-                await geist_ping_neues_datum(guild)
-            print(f"🌙 00:01 Tageswechsel: Log für {vorheriger_tag} gepostet, Routenwache für {heute} neu aufgesetzt.")
-        except Exception as e:
-            print(f"❌ Fehler beim Tageswechsel: {e}")
+        for route_id in list(data.get("routen", {}).keys()):
+            try:
+                if vorheriger_tag and vorheriger_tag != heute:
+                    await poste_tages_log(route_id, guild, vorheriger_tag)
+                await refresh_wache_nachricht(route_id, guild)
+                await refresh_gesamtuebersicht(route_id, guild)
+                if vorheriger_tag and vorheriger_tag != heute:
+                    await geist_ping_neues_datum(route_id, guild)
+            except Exception as e:
+                print(f"❌ Fehler beim Tageswechsel ({route_id}): {e}")
+    print(f"🌙 00:01 Tageswechsel für {len(data.get('routen', {}))} Route(n) verarbeitet.")
 
 @tageswechsel_check.before_loop
 async def before_tageswechsel_check():
@@ -721,21 +1024,6 @@ async def before_tageswechsel_check():
 # ════════════════════════════════════════════════════════════════════════════
 
 async def sync_commands():
-    """Synct die Slash-Commands.
-
-    BUGFIX (wichtig!): Die einmalige Bereinigung alter globaler Befehle
-    (`tree.clear_commands(guild=None)` + leerer Sync) darf NUR laufen,
-    wenn wir wirklich auf Guild-Sync umsteigen (also GUILD_ID gesetzt ist).
-    Vorher lief die Bereinigung IMMER, auch wenn GUILD_ID fehlte – dann
-    wurden die paar Zeilen zuvor frisch global registrierten Befehle im
-    selben Atemzug wieder gelöscht. Ergebnis: der Bot lief, aber es gab
-    dauerhaft keine sichtbaren Slash-Commands, ganz unabhängig von der
-    üblichen 'bis zu 1h'-Wartezeit für globale Syncs.
-
-    Ohne GUILD_ID wird jetzt NUR global gesynct (keine Bereinigung), damit
-    wenigstens dieser Fallback zuverlässig funktioniert – auch wenn er bis
-    zu 1h braucht. Sobald GUILD_ID gesetzt ist, läuft zuerst der sofortige
-    Guild-Sync und danach, einmalig, die Bereinigung alter globaler Reste."""
     if not GUILD_ID:
         try:
             synced = await tree.sync()
@@ -749,9 +1037,6 @@ async def sync_commands():
         tree.copy_global_to(guild=guild_obj)
         synced = await tree.sync(guild=guild_obj)
         print(f"✅ {len(synced)} Commands sofort auf Guild {GUILD_ID} gesynct: {[c.name for c in synced]}")
-    except discord.HTTPException as e:
-        print(f"❌ FEHLER beim Guild-Sync (evtl. Discord-Rate-Limit): {e}")
-        return
     except Exception as e:
         print(f"❌ FEHLER beim Guild-Sync: {e}")
         return
@@ -764,29 +1049,29 @@ async def sync_commands():
             save_data(data)
             print("🧹 Alte globale Befehle einmalig bereinigt.")
         except Exception as e:
-            print(f"⚠️ Konnte globale Befehle nicht bereinigen (wird beim nächsten Start erneut versucht): {e}")
+            print(f"⚠️ Konnte globale Befehle nicht bereinigen: {e}")
 
 
 @bot.event
 async def on_ready():
-    global letzter_bekannter_tag, wache_view
+    global letzter_bekannter_tag
     print(f"Bot online: {bot.user}")
 
-    if wache_view is None:
-        wache_view = WacheView()
-    bot.add_view(wache_view)
+    for route_id in data.get("routen", {}):
+        if route_id not in wache_views:
+            wache_views[route_id] = WacheView(route_id)
+        bot.add_view(wache_views[route_id])
 
     await sync_commands()
-
     letzter_bekannter_tag = heute_key()
 
     for guild in bot.guilds:
-        try:
-            await refresh_wache_nachricht(guild)
-            await refresh_gesamtuebersicht(guild)
-            print("✅ Routenwache-Nachricht & Leaderboard aufgesetzt.")
-        except Exception as e:
-            print(f"❌ Fehler beim Auto-Posten der Nachricht: {e}")
+        for route_id in list(data.get("routen", {}).keys()):
+            try:
+                await refresh_wache_nachricht(route_id, guild)
+                await refresh_gesamtuebersicht(route_id, guild)
+            except Exception as e:
+                print(f"❌ Fehler beim Auto-Posten ({route_id}): {e}")
 
     if not tageswechsel_check.is_running():
         tageswechsel_check.start()
@@ -796,30 +1081,31 @@ async def on_ready():
 
 @bot.event
 async def on_member_remove(member: discord.Member):
-    """Entfernt automatisch die HEUTIGEN Routenwache-Einträge eines
-    Mitglieds, sobald es den Server verlässt (Leave oder Kick).
-
-    Bereits abgeschlossene Tage bleiben unangetastet, damit rückwirkend
-    erspielte Stunden nicht aus dem Leaderboard verschwinden."""
+    """Entfernt automatisch die HEUTIGEN Einträge eines Mitglieds über
+    ALLE Routen hinweg, sobald es den Server verlässt. Abgeschlossene
+    Tage bleiben für die Gesamtübersicht erhalten."""
     uid = str(member.id)
-    eintrag = data.get("tage", {}).get(heute_key(), {})
-    geaendert = False
+    heute = heute_key()
+    betroffene_routen = []
 
-    for slot, liste in eintrag.items():
-        if uid in liste:
-            liste.remove(uid)
-            geaendert = True
+    for route_id in data.get("routen", {}):
+        eintrag = data.get("tage", {}).get(route_id, {}).get(heute, {})
+        for slot, liste in eintrag.items():
+            if uid in liste:
+                liste.remove(uid)
+                if route_id not in betroffene_routen:
+                    betroffene_routen.append(route_id)
 
-    if not geaendert:
+    if not betroffene_routen:
         return
 
     save_data(data)
-    print(f"🧹 Heutige Routenwache-Einträge von {member} ({uid}) entfernt (Server verlassen).")
-
-    try:
-        await refresh_wache_nachricht(member.guild)
-    except Exception as e:
-        print(f"❌ Fehler beim Aktualisieren nach Austritt: {e}")
+    print(f"🧹 Heutige Einträge von {member} ({uid}) entfernt (Server verlassen).")
+    for route_id in betroffene_routen:
+        try:
+            await refresh_wache_nachricht(route_id, member.guild)
+        except Exception as e:
+            print(f"❌ Fehler beim Aktualisieren nach Austritt ({route_id}): {e}")
 
 
 @bot.event
