@@ -54,6 +54,7 @@ def ist_admin_oder_leitung(interaction: discord.Interaction) -> bool:
 #         "channel_buttons": 123, "stempel_nachricht_id": "456",
 #         "channel_log": 123,
 #         "channel_leaderboard": 123, "leaderboard_nachricht_id": "456",
+#         "channel_wochenlog": 123,   # Sonntags-Wochenübersicht (Top 3 der letzten 7 Tage)
 #         "ping_rolle_id": None,   # optional: wird beim Tageswechsel geist-gepingt
 #         "gesperrte_tage": {"29.07.2026": "keine Zeit"},  # Tag -> Grund (optional)
 #     }, ...
@@ -254,6 +255,18 @@ def gesamt_zeit_pro_user(route_id: str) -> dict:
             continue
         if tag_datum >= heute:
             continue
+        for slot, liste in eintrag.items():
+            dauer = slot_dauer_stunden(slot)
+            for uid in liste:
+                zaehler[uid] = zaehler.get(uid, 0) + dauer
+    return zaehler
+
+def wochen_zeit_pro_user(route_id: str, tage_liste: list) -> dict:
+    """Summiert für jeden User die Stunden über die übergebene Liste von
+    Datums-Strings (z.B. die letzten 7 abgeschlossenen Tage vor Sonntag)."""
+    zaehler = {}
+    for datum in tage_liste:
+        eintrag = data.get("tage", {}).get(route_id, {}).get(datum, {})
         for slot, liste in eintrag.items():
             dauer = slot_dauer_stunden(slot)
             for uid in liste:
@@ -531,6 +544,61 @@ async def poste_tages_log(route_id: str, guild: discord.Guild, datum: str):
 
 
 # ════════════════════════════════════════════════════════════════════════════
+# 📅  WOCHENÜBERSICHT (jeden Sonntag 00:01 Uhr, Top 3 der letzten 7 Tage)
+# ════════════════════════════════════════════════════════════════════════════
+# Bei Punktgleichstand teilen sich mehrere Mitglieder denselben Platz
+# (Standard-Ranking: z.B. zwei geteilte 1. Plätze -> nächster Platz ist "3.").
+
+def build_wochenuebersicht_embed(route_id: str, tage_liste: list, guild: discord.Guild) -> discord.Embed:
+    route = data["routen"][route_id]
+    zaehler = wochen_zeit_pro_user(route_id, tage_liste)
+
+    if not zaehler:
+        beschreibung = "Niemand hat in den letzten 7 Tagen Stunden gesammelt."
+    else:
+        sortiert = sorted(zaehler.items(), key=lambda x: x[1], reverse=True)
+        # Die 3 höchsten (unterschiedlichen) Stundenwerte ermitteln - alle
+        # Mitglieder mit einem dieser Werte werden gelistet, auch wenn dadurch
+        # mehr als 3 Namen erscheinen (geteilte Plätze).
+        top_werte = sorted({h for _, h in sortiert}, reverse=True)[:3]
+        gefiltert = [(uid, h) for uid, h in sortiert if h in top_werte]
+
+        medaillen = {1: "🥇", 2: "🥈", 3: "🥉"}
+        zeilen = []
+        rang = 0
+        vorheriger_wert = None
+        for i, (uid, h) in enumerate(gefiltert, start=1):
+            if h != vorheriger_wert:
+                rang = i
+                vorheriger_wert = h
+            member = guild.get_member(int(uid)) if guild else None
+            name = member.mention if member else f"Unbekanntes Mitglied ({uid})"
+            stunden_text = f"{h:.1f}".rstrip("0").rstrip(".")
+            medaille = medaillen.get(rang, "🏅")
+            zeilen.append(f"{medaille} **Platz {rang}** — {name} ({stunden_text}h)")
+        beschreibung = "\n".join(zeilen)
+
+    zeitraum_text = f"{tage_liste[-1]} – {tage_liste[0]}" if tage_liste else "-"
+    embed = discord.Embed(
+        title=f"📅 Wochenübersicht – {route['name']}",
+        description=beschreibung,
+        color=EMBED_COLOR,
+    )
+    embed.set_footer(text=f"ECLIPSE – {route['name']} • Top 3 der letzten 7 Tage ({zeitraum_text}) • bei Gleichstand wird sich der Platz geteilt")
+    embed.timestamp = datetime.now(TIMEZONE)
+    return embed
+
+async def poste_wochenuebersicht(route_id: str, guild: discord.Guild, tage_liste: list):
+    route = data.get("routen", {}).get(route_id)
+    if not route or not route.get("channel_wochenlog"):
+        return
+    kanal = guild.get_channel(int(route["channel_wochenlog"]))
+    if not kanal:
+        return
+    await kanal.send(embed=build_wochenuebersicht_embed(route_id, tage_liste, guild))
+
+
+# ════════════════════════════════════════════════════════════════════════════
 # 📊  GESAMTÜBERSICHT / LEADERBOARD (pro Route, nur abgeschlossene Tage)
 # ════════════════════════════════════════════════════════════════════════════
 
@@ -617,6 +685,7 @@ async def route_erstellen(interaction: discord.Interaction, name: str, kapazitae
         "channel_log": None,
         "channel_leaderboard": None,
         "leaderboard_nachricht_id": None,
+        "channel_wochenlog": None,
         "ping_rolle_id": None,
         "gesperrte_tage": {},
         "aktive_wochentage": [],
@@ -914,6 +983,17 @@ async def route_channel_leaderboard_setzen(interaction: discord.Interaction, rou
     await interaction.response.send_message(f"✅ Leaderboard-Channel gesetzt: {channel.mention}", ephemeral=True)
     await refresh_gesamtuebersicht(route, interaction.guild)
 
+@tree.command(name="route_channel_wochenlog_setzen", description="Setzt den Channel für die Wochenübersicht (jeden Sonntag, Top 3) einer Route")
+@app_commands.autocomplete(route=route_autocomplete)
+@app_commands.check(ist_admin_oder_leitung)
+async def route_channel_wochenlog_setzen(interaction: discord.Interaction, route: str, channel: discord.TextChannel):
+    if route not in data.get("routen", {}):
+        await interaction.response.send_message("❌ Route nicht gefunden.", ephemeral=True)
+        return
+    data["routen"][route]["channel_wochenlog"] = channel.id
+    save_data(data)
+    await interaction.response.send_message(f"✅ Wochenlog-Channel gesetzt: {channel.mention}", ephemeral=True)
+
 @tree.command(name="route_ping_rolle_setzen", description="Setzt eine Rolle, die beim Tageswechsel geist-gepingt wird (optional)")
 @app_commands.autocomplete(route=route_autocomplete)
 @app_commands.check(ist_admin_oder_leitung)
@@ -947,6 +1027,22 @@ async def route_posten(interaction: discord.Interaction, route: str):
     await refresh_wache_nachricht(route, interaction.guild)
     await interaction.followup.send("✅ Buttons-Nachricht gepostet/aktualisiert.", ephemeral=True)
 
+@tree.command(name="route_wochenuebersicht_testen", description="Postet sofort eine Wochenübersicht (Top 3, letzte 7 Tage) zum Testen")
+@app_commands.autocomplete(route=route_autocomplete)
+@app_commands.check(ist_admin_oder_leitung)
+async def route_wochenuebersicht_testen(interaction: discord.Interaction, route: str):
+    if route not in data.get("routen", {}):
+        await interaction.response.send_message("❌ Route nicht gefunden.", ephemeral=True)
+        return
+    if not data["routen"][route].get("channel_wochenlog"):
+        await interaction.response.send_message("❌ Für diese Route ist noch kein Wochenlog-Channel gesetzt (`/route_channel_wochenlog_setzen`).", ephemeral=True)
+        return
+    heute_datum = datetime.now(TIMEZONE).date()
+    tage_liste = [(heute_datum - timedelta(days=i)).strftime("%d.%m.%Y") for i in range(1, 8)]
+    await interaction.response.defer(ephemeral=True)
+    await poste_wochenuebersicht(route, interaction.guild, tage_liste)
+    await interaction.followup.send("✅ Wochenübersicht gepostet.", ephemeral=True)
+
 @tree.command(name="routen_liste", description="Zeigt alle konfigurierten Routen mit ihren Einstellungen")
 @app_commands.check(ist_admin_oder_leitung)
 async def routen_liste(interaction: discord.Interaction):
@@ -968,12 +1064,13 @@ async def routen_liste(interaction: discord.Interaction):
         btn_ch = f"<#{info['channel_buttons']}>" if info.get("channel_buttons") else "❌"
         log_ch = f"<#{info['channel_log']}>" if info.get("channel_log") else "❌"
         lb_ch = f"<#{info['channel_leaderboard']}>" if info.get("channel_leaderboard") else "❌"
+        wl_ch = f"<#{info['channel_wochenlog']}>" if info.get("channel_wochenlog") else "❌"
         gesperrte_tage = info.get("gesperrte_tage", {})
         sperr_text = f"\nGesperrte Tage: {', '.join(sorted(gesperrte_tage.keys()))}" if gesperrte_tage else ""
         wochentage_text = wochentage_anzeige(info.get("aktive_wochentage", []))
         embed.add_field(
             name=f"{info['name']} (`{rid}`)",
-            value=f"Kapazität: **{info['kapazitaet']}**/Zeitraum\nZeiträume: {slots_text}\nAktive Wochentage (Route): **{wochentage_text}**\nButtons: {btn_ch} • Log: {log_ch} • Leaderboard: {lb_ch}{sperr_text}",
+            value=f"Kapazität: **{info['kapazitaet']}**/Zeitraum\nZeiträume: {slots_text}\nAktive Wochentage (Route): **{wochentage_text}**\nButtons: {btn_ch} • Log: {log_ch} • Leaderboard: {lb_ch} • Wochenlog: {wl_ch}{sperr_text}",
             inline=False
         )
     await interaction.response.send_message(embed=embed, ephemeral=True)
@@ -1195,7 +1292,13 @@ async def tageswechsel_check():
     global letzter_bekannter_tag
     vorheriger_tag = letzter_bekannter_tag
     heute = heute_key()
+    heute_datum = datetime.now(TIMEZONE).date()
     letzter_bekannter_tag = heute
+
+    # Sonntags (nach einem echten Tageswechsel) zusätzlich die Wochenübersicht
+    # der letzten 7 abgeschlossenen Tage posten.
+    ist_sonntag = heute_datum.weekday() == 6
+    wochen_tage_liste = [(heute_datum - timedelta(days=i)).strftime("%d.%m.%Y") for i in range(1, 8)]
 
     for guild in bot.guilds:
         for route_id in list(data.get("routen", {}).keys()):
@@ -1206,9 +1309,12 @@ async def tageswechsel_check():
                 await refresh_gesamtuebersicht(route_id, guild)
                 if vorheriger_tag and vorheriger_tag != heute:
                     await geist_ping_neues_datum(route_id, guild)
+                if ist_sonntag and vorheriger_tag and vorheriger_tag != heute:
+                    await poste_wochenuebersicht(route_id, guild, wochen_tage_liste)
             except Exception as e:
                 print(f"❌ Fehler beim Tageswechsel ({route_id}): {e}")
-    print(f"🌙 00:01 Tageswechsel für {len(data.get('routen', {}))} Route(n) verarbeitet.")
+    print(f"🌙 00:01 Tageswechsel für {len(data.get('routen', {}))} Route(n) verarbeitet."
+          + (" (inkl. Wochenübersicht)" if ist_sonntag else ""))
 
 @tageswechsel_check.before_loop
 async def before_tageswechsel_check():
