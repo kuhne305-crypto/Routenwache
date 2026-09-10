@@ -6,6 +6,7 @@ import pytz
 import json
 import os
 import re
+import uuid
 
 # ════════════════════════════════════════════════════════════════════════════
 # ⚙️  KONFIGURATION
@@ -60,11 +61,15 @@ def ist_admin_oder_leitung(interaction: discord.Interaction) -> bool:
 #     }, ...
 # }
 # "tage": { "morteco_heroin_route": { "29.07.2026": { "18:00-19:30": ["uid", ...] } } }
+# "manuell": { "morteco_heroin_route": { "29.07.2026": [
+#     {"id": "a1b2c3d4", "uid": "123", "stunden": 1.5, "grund": "spontane Extra-Schicht", "von": "123"},
+# ... ] } }   # freie Stunden-Nachträge, nicht an einen Zeitraum gebunden
 # "gesperrte_user": ["uid", ...]   # globale Routensperre, gilt für ALLE Routen
 
 STANDARD_DATEN = {
     "routen": {},
     "tage": {},
+    "manuell": {},
     "gesperrte_user": [],
     "globale_befehle_bereinigt": False,
 }
@@ -243,9 +248,15 @@ def get_tag_eintrag(route_id: str, datum: str) -> dict:
 def alle_slots_von_user(eintrag: dict, uid: str) -> list:
     return [slot for slot, liste in eintrag.items() if uid in liste]
 
+def manuelle_eintraege_holen(route_id: str, datum: str) -> list:
+    """Holt (oder erstellt) die Liste der freien Stunden-Nachträge einer
+    Route für ein Datum. Jeder Eintrag: {id, uid, stunden, grund, von}."""
+    return data.setdefault("manuell", {}).setdefault(route_id, {}).setdefault(datum, [])
+
 def gesamt_zeit_pro_user(route_id: str) -> dict:
     """Summiert für jeden User die Stunden auf ABGESCHLOSSENEN Tagen
-    (heute und Zukunft zählen bewusst noch nicht mit)."""
+    (heute und Zukunft zählen bewusst noch nicht mit). Berücksichtigt
+    sowohl normale Zeitraum-Eintragungen als auch manuelle Nachträge."""
     zaehler = {}
     heute = datetime.now(TIMEZONE).date()
     for datum, eintrag in data.get("tage", {}).get(route_id, {}).items():
@@ -259,11 +270,21 @@ def gesamt_zeit_pro_user(route_id: str) -> dict:
             dauer = slot_dauer_stunden(slot)
             for uid in liste:
                 zaehler[uid] = zaehler.get(uid, 0) + dauer
+    for datum, eintraege in data.get("manuell", {}).get(route_id, {}).items():
+        try:
+            tag_datum = datetime.strptime(datum, "%d.%m.%Y").date()
+        except ValueError:
+            continue
+        if tag_datum >= heute:
+            continue
+        for eintrag in eintraege:
+            zaehler[eintrag["uid"]] = zaehler.get(eintrag["uid"], 0) + eintrag["stunden"]
     return zaehler
 
 def wochen_zeit_pro_user(route_id: str, tage_liste: list) -> dict:
     """Summiert für jeden User die Stunden über die übergebene Liste von
-    Datums-Strings (z.B. die letzten 7 abgeschlossenen Tage vor Sonntag)."""
+    Datums-Strings (z.B. die letzten 7 abgeschlossenen Tage vor Sonntag).
+    Berücksichtigt sowohl Zeitraum-Eintragungen als auch manuelle Nachträge."""
     zaehler = {}
     for datum in tage_liste:
         eintrag = data.get("tage", {}).get(route_id, {}).get(datum, {})
@@ -271,6 +292,8 @@ def wochen_zeit_pro_user(route_id: str, tage_liste: list) -> dict:
             dauer = slot_dauer_stunden(slot)
             for uid in liste:
                 zaehler[uid] = zaehler.get(uid, 0) + dauer
+        for manueller_eintrag in data.get("manuell", {}).get(route_id, {}).get(datum, []):
+            zaehler[manueller_eintrag["uid"]] = zaehler.get(manueller_eintrag["uid"], 0) + manueller_eintrag["stunden"]
     return zaehler
 
 def entferne_aus_allen_zukuenftigen_eintraegen(uid: str) -> list:
@@ -318,6 +341,27 @@ async def zeitraum_autocomplete(interaction: discord.Interaction, current: str):
         label = f"{slot_label(slot)} ({besetzt}/{route['kapazitaet']}, {tage_kuerzel})"
         if current.lower() in slot.lower():
             ergebnisse.append(app_commands.Choice(name=label[:100], value=slot))
+    return ergebnisse[:25]
+
+async def manueller_eintrag_autocomplete(interaction: discord.Interaction, current: str):
+    route_id = getattr(interaction.namespace, "route", None)
+    datum_roh = getattr(interaction.namespace, "datum", None)
+    if not route_id:
+        return []
+    try:
+        datum = parse_datum(datum_roh) if datum_roh else heute_key()
+    except ValueError:
+        return []
+    eintraege = data.get("manuell", {}).get(route_id, {}).get(datum, [])
+    ergebnisse = []
+    for eintrag in eintraege:
+        member = interaction.guild.get_member(int(eintrag["uid"])) if interaction.guild else None
+        name = member.display_name if member else f"Unbekannt ({eintrag['uid']})"
+        stunden_text = f"{eintrag['stunden']:.1f}".rstrip("0").rstrip(".")
+        grund_text = f" – {eintrag['grund']}" if eintrag.get("grund") else ""
+        label = f"{name}: {stunden_text}h{grund_text} ({eintrag['id']})"
+        if current.lower() in label.lower():
+            ergebnisse.append(app_commands.Choice(name=label[:100], value=eintrag["id"]))
     return ergebnisse[:25]
 
 
@@ -524,6 +568,13 @@ def build_tages_log_embed(route_id: str, datum: str, guild: discord.Guild) -> di
             member = guild.get_member(int(uid)) if guild else None
             name = member.mention if member else f"Unbekanntes Mitglied ({uid})"
             zeilen.append(f"{name} — **{slot_label(slot)}**")
+
+    for manueller_eintrag in data.get("manuell", {}).get(route_id, {}).get(datum, []):
+        member = guild.get_member(int(manueller_eintrag["uid"])) if guild else None
+        name = member.mention if member else f"Unbekanntes Mitglied ({manueller_eintrag['uid']})"
+        stunden_text = f"{manueller_eintrag['stunden']:.1f}".rstrip("0").rstrip(".")
+        grund_text = f" ({manueller_eintrag['grund']})" if manueller_eintrag.get("grund") else ""
+        zeilen.append(f"{name} — **{stunden_text}h manuell nachgetragen**{grund_text}")
 
     beschreibung = "\n".join(f"{i}. {z}" for i, z in enumerate(zeilen, start=1)) if zeilen else \
         "Niemand war an diesem Tag eingetragen."
@@ -1191,6 +1242,142 @@ async def wache_austragen(interaction: discord.Interaction, route: str, mitglied
     if tag == heute_key():
         await refresh_wache_nachricht(route, interaction.guild)
 
+@tree.command(name="stunden_hinzufuegen", description="Trägt frei wählbare Extra-Stunden nach, die an keinen festen Zeitraum gebunden sind")
+@app_commands.describe(
+    route="Die Route",
+    stunden="Anzahl Stunden, z.B. 1 oder 1.5",
+    mitglied="Optional: anderes Mitglied (Standard: du selbst)",
+    datum="Optional: Datum TT.MM.JJJJ (Standard: heute)",
+    grund="Optional: Notiz, z.B. 'spontane Zusatzschicht'"
+)
+@app_commands.autocomplete(route=route_autocomplete)
+async def stunden_hinzufuegen(interaction: discord.Interaction, route: str, stunden: float, mitglied: discord.Member = None, datum: str = None, grund: str = None):
+    if route not in data.get("routen", {}):
+        await interaction.response.send_message("❌ Route nicht gefunden.", ephemeral=True)
+        return
+    if stunden <= 0:
+        await interaction.response.send_message("❌ Stunden müssen größer als 0 sein.", ephemeral=True)
+        return
+    if stunden > 24:
+        await interaction.response.send_message("❌ Mehr als 24 Stunden an einem Tag ist unrealistisch. Bitte prüfe die Eingabe.", ephemeral=True)
+        return
+
+    ziel = mitglied or interaction.user
+    uid = str(ziel.id)
+    if uid in data.get("gesperrte_user", []):
+        await interaction.response.send_message(f"❌ {ziel.mention} hat aktuell eine Routensperre.", ephemeral=True)
+        return
+
+    if datum:
+        try:
+            tag = parse_datum(datum)
+        except ValueError:
+            await interaction.response.send_message("❌ Ungültiges Datum. Format: **TT.MM.JJJJ**, z.B. `27.07.2026`.", ephemeral=True)
+            return
+    else:
+        tag = heute_key()
+
+    eintrag_liste = manuelle_eintraege_holen(route, tag)
+    neuer_eintrag = {
+        "id": uuid.uuid4().hex[:8],
+        "uid": uid,
+        "stunden": round(stunden, 2),
+        "grund": grund,
+        "von": str(interaction.user.id),
+    }
+    eintrag_liste.append(neuer_eintrag)
+    save_data(data)
+
+    stunden_text = f"{neuer_eintrag['stunden']:.1f}".rstrip("0").rstrip(".")
+    grund_text = f"\nGrund: {grund}" if grund else ""
+    routeninfo = data["routen"][route]
+    await interaction.response.send_message(
+        f"✅ {stunden_text}h für {ziel.mention} am **{tag}** bei **{routeninfo['name']}** manuell nachgetragen "
+        f"(ID: `{neuer_eintrag['id']}`).{grund_text}",
+        ephemeral=True
+    )
+
+@tree.command(name="stunden_entfernen", description="Entfernt einen manuellen Stunden-Nachtrag wieder (per ID oder alle eines Mitglieds an dem Tag)")
+@app_commands.describe(
+    route="Die Route",
+    mitglied="Optional: nur Einträge dieses Mitglieds entfernen (Standard: du selbst, falls keine ID angegeben)",
+    datum="Optional: Datum TT.MM.JJJJ (Standard: heute)",
+    eintrag_id="Optional: konkrete Eintrag-ID (siehe Autocomplete) statt alle des Mitglieds zu entfernen"
+)
+@app_commands.autocomplete(route=route_autocomplete, eintrag_id=manueller_eintrag_autocomplete)
+async def stunden_entfernen(interaction: discord.Interaction, route: str, mitglied: discord.Member = None, datum: str = None, eintrag_id: str = None):
+    if route not in data.get("routen", {}):
+        await interaction.response.send_message("❌ Route nicht gefunden.", ephemeral=True)
+        return
+
+    if datum:
+        try:
+            tag = parse_datum(datum)
+        except ValueError:
+            await interaction.response.send_message("❌ Ungültiges Datum. Format: **TT.MM.JJJJ**, z.B. `27.07.2026`.", ephemeral=True)
+            return
+    else:
+        tag = heute_key()
+
+    eintrag_liste = manuelle_eintraege_holen(route, tag)
+
+    if eintrag_id:
+        gefunden = next((e for e in eintrag_liste if e["id"] == eintrag_id), None)
+        if not gefunden:
+            await interaction.response.send_message("❌ Kein Eintrag mit dieser ID an diesem Tag gefunden.", ephemeral=True)
+            return
+        eintrag_liste.remove(gefunden)
+        save_data(data)
+        stunden_text = f"{gefunden['stunden']:.1f}".rstrip("0").rstrip(".")
+        member = interaction.guild.get_member(int(gefunden["uid"])) if interaction.guild else None
+        name = member.mention if member else f"Unbekanntes Mitglied ({gefunden['uid']})"
+        await interaction.response.send_message(f"🗑️ Nachtrag entfernt: {name} — **{stunden_text}h** am **{tag}**.", ephemeral=True)
+        return
+
+    ziel = mitglied or interaction.user
+    uid = str(ziel.id)
+    vorher = len(eintrag_liste)
+    eintrag_liste[:] = [e for e in eintrag_liste if e["uid"] != uid]
+    entfernt = vorher - len(eintrag_liste)
+    if entfernt == 0:
+        await interaction.response.send_message(f"❌ {ziel.mention} hat am **{tag}** keine manuellen Nachträge bei dieser Route.", ephemeral=True)
+        return
+    save_data(data)
+    await interaction.response.send_message(f"🗑️ {entfernt} manuelle(r) Nachtrag/Nachträge von {ziel.mention} am **{tag}** entfernt.", ephemeral=True)
+
+@tree.command(name="route_manuelle_stunden_liste", description="Zeigt alle manuellen Stunden-Nachträge einer Route für einen Tag (inkl. IDs)")
+@app_commands.describe(route="Die Route", datum="Optional: Datum TT.MM.JJJJ (Standard: heute)")
+@app_commands.autocomplete(route=route_autocomplete)
+async def route_manuelle_stunden_liste(interaction: discord.Interaction, route: str, datum: str = None):
+    if route not in data.get("routen", {}):
+        await interaction.response.send_message("❌ Route nicht gefunden.", ephemeral=True)
+        return
+    if datum:
+        try:
+            tag = parse_datum(datum)
+        except ValueError:
+            await interaction.response.send_message("❌ Ungültiges Datum. Format: **TT.MM.JJJJ**, z.B. `27.07.2026`.", ephemeral=True)
+            return
+    else:
+        tag = heute_key()
+
+    eintraege = data.get("manuell", {}).get(route, {}).get(tag, [])
+    routeninfo = data["routen"][route]
+    if not eintraege:
+        beschreibung = "*Keine manuellen Nachträge an diesem Tag.*"
+    else:
+        zeilen = []
+        for e in eintraege:
+            member = interaction.guild.get_member(int(e["uid"])) if interaction.guild else None
+            name = member.mention if member else f"Unbekanntes Mitglied ({e['uid']})"
+            stunden_text = f"{e['stunden']:.1f}".rstrip("0").rstrip(".")
+            grund_text = f" — {e['grund']}" if e.get("grund") else ""
+            zeilen.append(f"`{e['id']}` — {name}: **{stunden_text}h**{grund_text}")
+        beschreibung = "\n".join(zeilen)
+
+    embed = discord.Embed(title=f"📝 Manuelle Nachträge – {routeninfo['name']} ({tag})", description=beschreibung, color=EMBED_COLOR)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
 @tree.command(name="meine_wache", description="Zeigt deinen heutigen Routenwache-Status (alle Routen oder eine bestimmte)")
 @app_commands.describe(route="Optional: nur eine bestimmte Route anzeigen")
 @app_commands.autocomplete(route=route_autocomplete)
@@ -1205,6 +1392,11 @@ async def meine_wache(interaction: discord.Interaction, route: str = None):
         slots = alle_slots_von_user(eintrag, uid)
         for slot in slots:
             zeilen.append(f"🟢 **{info['name']}** — {slot_label(slot)}")
+        for manueller_eintrag in data.get("manuell", {}).get(rid, {}).get(today, []):
+            if manueller_eintrag["uid"] == uid:
+                stunden_text = f"{manueller_eintrag['stunden']:.1f}".rstrip("0").rstrip(".")
+                grund_text = f" ({manueller_eintrag['grund']})" if manueller_eintrag.get("grund") else ""
+                zeilen.append(f"📝 **{info['name']}** — {stunden_text}h manuell nachgetragen{grund_text}")
 
     text = "\n".join(zeilen) if zeilen else "🔴 Du bist heute für keinen Zeitraum eingetragen."
     gesperrt_hinweis = "\n\n🔒 Du hast aktuell eine Routensperre." if uid in data.get("gesperrte_user", []) else ""
